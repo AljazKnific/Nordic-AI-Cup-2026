@@ -10,9 +10,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Your model and the server. The sample data under src/ is not copied: it is
-# 400 MB and only local_evaluator.py needs it.
+# The detector and motion fallback load reference crops and annotations from
+# src/helsinki at startup, so they must be present in the deployed image.
 COPY dtos.py utils.py example.py api.py ./
+COPY src ./src
 
 EXPOSE 9053
 

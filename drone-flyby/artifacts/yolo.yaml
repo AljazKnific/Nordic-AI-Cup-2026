@@ -1,0 +1,20 @@
+path: /Users/arejula11/Documents/Nordic-AI-Cup-2026/drone-flyby/artifacts/yolo
+train: train/images
+val: val/images
+names:
+  0: condor
+  1: hangar
+  2: helicopter
+  3: jammer
+  4: jet_plane
+  5: large_launcher
+  6: large_tower
+  7: medium_launcher
+  8: medium_plane
+  9: mine_roller
+  10: small_launcher
+  11: small_plane
+  12: small_tower
+  13: spacecraft
+  14: ta-ta
+  15: tank

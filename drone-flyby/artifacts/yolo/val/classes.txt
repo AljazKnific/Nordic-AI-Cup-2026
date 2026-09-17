@@ -1,0 +1,16 @@
+condor
+hangar
+helicopter
+jammer
+jet_plane
+large_launcher
+large_tower
+medium_launcher
+medium_plane
+mine_roller
+small_launcher
+small_plane
+small_tower
+spacecraft
+ta-ta
+tank

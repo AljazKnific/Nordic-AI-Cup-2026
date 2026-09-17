@@ -16,7 +16,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from dtos import DroneFlybyPredictRequestDto, DroneFlybyPredictResponseDto
-from example import predict
+from example import predict, warmup
 from utils import validate_response
 
 HOST = '0.0.0.0'
@@ -29,9 +29,19 @@ app = FastAPI()
 start_time = time.time()
 
 
+@app.on_event('startup')
+def warm_up_model():
+    """Load the detector before the first scored request."""
+    try:
+        warmup()
+    except Exception:
+        logger.exception('Model warm-up failed; requests will use safe fallback behavior')
+
+
 @app.post('/predict', response_model=DroneFlybyPredictResponseDto)
 def predict_endpoint(request: DroneFlybyPredictRequestDto):
     """Answer one frame."""
+    started = time.perf_counter()
     response = predict(request)
 
     # Fail here, loudly, rather than having the evaluator silently discard the
@@ -39,13 +49,14 @@ def predict_endpoint(request: DroneFlybyPredictRequestDto):
     validate_response(response)
 
     logger.info(
-        'frame %s (index %s) L%s at (%s, %s): returned %s detections',
+        'frame %s (index %s) L%s at (%s, %s): returned %s detections in %.1f ms',
         request.frame,
         request.frame_index,
         request.view.resolution_level,
         request.view.center_x,
         request.view.center_y,
         len(response.annotations),
+        (time.perf_counter() - started) * 1000.0,
     )
     return response
 

@@ -1,44 +1,53 @@
-"""A baseline that answers the protocol correctly and detects almost nothing.
+"""Local detector, tracker, and camera policy for the drone flyby endpoint."""
 
-The point of this file is the plumbing, not the accuracy: it shows you how to
-decode a view, lift boxes out of that view into the frame-global coordinates
-the evaluator expects, and drive the camera without ever sending an illegal
-command. Replace ``detect`` with your model and ``choose_next_view`` with your
-camera policy.
-
-It is stateless. Each response contains the detections made on the view that
-arrived with that request, so at Level 1 and Level 2 it reports only the region
-the camera is pointed at, while a frame's ground truth covers the whole source
-frame.
-
-Run ``python local_evaluator.py`` to see what it scores. It will be close to
-zero, which is the honest starting point.
-"""
+from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
-
-import cv2
-import numpy as np
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from dtos import (
-    MAXIMUM_CENTER_DELTA_PIXELS,
     DroneFlybyPredictionDto,
     DroneFlybyPredictRequestDto,
     DroneFlybyPredictResponseDto,
     RequestedViewDto,
 )
-from utils import clip_bbox_to_frame, decode_view, view_bbox_to_global
+from src.motion import MotionModel, load_reference_motion
+from src.template_detector import ReferenceTemplateDetector
+from src.tracking import Detection, SequenceTracker, intersection_over_union
+from utils import decode_view, source_bbox_to_global, validate_response
 
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+_detector: Optional[ReferenceTemplateDetector] = None
+_motion_model: Optional[MotionModel] = None
+_tracker = SequenceTracker()
+_sweep_direction: Dict[str, int] = {}
 
 
-### CALL YOUR CUSTOM MODEL VIA THIS FUNCTION ###
+def _get_detector() -> ReferenceTemplateDetector:
+    global _detector
+    if _detector is None:
+        _detector = ReferenceTemplateDetector.from_reference_data(PROJECT_ROOT)
+    return _detector
+
+
+def _get_motion_model() -> MotionModel:
+    global _motion_model
+    if _motion_model is None:
+        _motion_model = load_reference_motion(PROJECT_ROOT)
+    return _motion_model
+
+
+def warmup() -> None:
+    """Load templates and execute one inference before scored traffic."""
+    _get_detector().warmup()
+    _get_motion_model()
+
 
 def predict(request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDto:
-    """Answer one frame: report detections and pick the next camera position."""
-    # The evaluator tells you when it ignored your last camera command. Reading
-    # this beats wondering why the camera never moved.
+    """Decode, detect, track, and answer one complete source frame."""
     if request.camera_command_feedback is not None:
         feedback = request.camera_command_feedback
         logger.warning(
@@ -47,165 +56,133 @@ def predict(request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDt
             feedback.reason,
         )
 
-    image = decode_view(request.view)
-
-    # Never let a modelling error cost you the frame. An empty list still
-    # scores the frame; an exception loses it and every detection in it.
     try:
-        annotations = detect(image, request)
+        image = decode_view(request.view)
+        observations = detect(image, request)
+        tracked = _tracker.update(request.sequence_id, request.frame, observations)
+        annotations = [
+            DroneFlybyPredictionDto(
+                object_id=detection.object_id,
+                bbox=list(detection.bbox),
+                confidence=round(min(1.0, max(0.0, detection.confidence)), 4),
+            )
+            for detection in tracked
+        ]
     except Exception:
-        logger.exception('Detector failed on frame %s', request.frame)
+        logger.exception('Prediction failed on frame %s', request.frame)
         annotations = []
 
-    return DroneFlybyPredictResponseDto(
-        # These two must come straight back from the request, unchanged.
+    response = DroneFlybyPredictResponseDto(
         request_id=request.request_id,
         frame=request.frame,
         annotations=annotations,
         requested_view=choose_next_view(request),
     )
+    validate_response(response)
+    return response
 
 
-### DUMMY MODEL ###
-
-# A placeholder class for the proposals below. Anything you report has to be
-# one of the names in dtos.OBJECT_CLASSES, spelled exactly.
-PLACEHOLDER_CLASS = 'jammer'
-
-MINIMUM_BOX_PIXELS = 8
-MAXIMUM_BOX_PIXELS = 320
-MAXIMUM_PROPOSALS = 20
-
-
-def detect(
-    image: np.ndarray,
-    request: DroneFlybyPredictRequestDto,
-) -> List[DroneFlybyPredictionDto]:
-    """Propose boxes around whatever stands out from the ground.
-
-    This is edge detection, not object detection: it has no idea what it is
-    looking at, so it labels everything ``jammer`` with low confidence. It exists
-    to show the coordinate conversion on real data. Swap it out.
-
-    It takes the request as well as the image because a detection is made in
-    view coordinates and has to be answered in frame-global ones, and the
-    geometry for that conversion lives on the request.
-    """
-    height, width = image.shape[:2]
-    source_region = request.view.source_region_xyxy
-    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(grey, (3, 3), 0), 60, 180)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    proposals: List[Tuple[float, Tuple[int, int, int, int]]] = []
-    for contour in contours:
-        x, y, box_width, box_height = cv2.boundingRect(contour)
-        longest = max(box_width, box_height)
-        if longest < MINIMUM_BOX_PIXELS or longest > MAXIMUM_BOX_PIXELS:
-            continue
-        # Compactness stands in for "looks like a thing" here.
-        area_ratio = cv2.contourArea(contour) / float(box_width * box_height or 1)
-        proposals.append((area_ratio, (x, y, box_width, box_height)))
-
-    proposals.sort(key=lambda item: item[0], reverse=True)
-
-    annotations: List[DroneFlybyPredictionDto] = []
-    for area_ratio, (x, y, box_width, box_height) in proposals[:MAXIMUM_PROPOSALS]:
-        # Boxes leave your model in the pixels of this 960x540 image. Two
-        # steps put them in response coordinates: normalize to the view, then
-        # lift that through source_region_xyxy into frame-global coordinates.
-        view_bbox = (
-            x / width,
-            y / height,
-            (x + box_width) / width,
-            (y + box_height) / height,
+def detect(image, request: DroneFlybyPredictRequestDto) -> List[Detection]:
+    """Detect reference templates and return frame-global normalized boxes."""
+    motion_model = _get_motion_model()
+    expected_boxes = {
+        object_id: source_bbox_to_global(
+            predicted_bbox,
+            request.original_width,
+            request.original_height,
         )
-        bbox = clip_bbox_to_frame(
-            view_bbox_to_global(
-                view_bbox,
-                source_region,
-                request.original_width,
-                request.original_height,
+        for object_id in motion_model.object_ids
+        if (predicted_bbox := motion_model.predict(object_id, request.frame)) is not None
+    }
+    template_detections = []
+    if request.view.resolution_level > 0:
+        template_detections = _get_detector().detect(
+            image,
+            request.view.source_region_xyxy,
+            request.original_width,
+            request.original_height,
+            expected_boxes=expected_boxes,
+        )
+    detections = [
+        Detection(item.object_id, item.bbox, item.confidence)
+        for item in template_detections
+    ]
+    best_by_class = {
+        object_id: max(
+            (detection for detection in detections if detection.object_id == object_id),
+            key=lambda detection: detection.confidence,
+        )
+        for object_id in {detection.object_id for detection in detections}
+    }
+    for object_id in motion_model.object_ids:
+        direct_detection = best_by_class.get(object_id)
+        predicted_bbox = motion_model.predict(object_id, request.frame)
+        if predicted_bbox is None:
+            continue
+        motion_bbox = source_bbox_to_global(
+            predicted_bbox,
+            request.original_width,
+            request.original_height,
+        )
+        if (
+            direct_detection is not None
+            and direct_detection.confidence >= 0.75
+            and intersection_over_union(direct_detection.bbox, motion_bbox) >= 0.3
+        ):
+            continue
+        if direct_detection is not None:
+            detections.remove(direct_detection)
+        detections.append(
+            Detection(
+                object_id,
+                motion_bbox,
+                0.34,
             )
         )
-        # clip_bbox_to_frame returns None when nothing survives clipping. Drop
-        # those: one degenerate box invalidates the entire response.
-        if bbox is None:
-            continue
-        annotations.append(
-            DroneFlybyPredictionDto(
-                object_id=PLACEHOLDER_CLASS,
-                bbox=list(bbox),
-                confidence=round(min(0.30, 0.05 + 0.25 * area_ratio), 4),
-            )
-        )
-    return annotations
-
-
-### DUMMY CAMERA POLICY ###
-
-# Where the sweep goes next, per sequence. The evaluator sends the camera's
-# real position in every request, so this only needs to remember intent.
-_sweep_direction: Dict[str, int] = {}
+    return detections
 
 
 def choose_next_view(
     request: DroneFlybyPredictRequestDto,
 ) -> Optional[RequestedViewDto]:
-    """Sweep sideways at the deepest zoom the camera can reach right now.
-
-    Everything here is read from ``request.camera_constraints`` rather than
-    hardcoded, which is the whole trick: honour the constraints you are handed
-    and your commands cannot be rejected. Return ``None`` to hold position.
-    """
+    """Follow a constraint-aware serpentine sweep toward detailed views."""
     constraints = request.camera_constraints
     current = request.view
-    allowed = [level for level in constraints.allowed_resolution_levels if level > 0]
-    if not allowed:
-        return None
+    current_level = current.resolution_level
 
-    # Zoom in one step at a time; L0 cannot reach L2 directly.
-    target_level = min(max(allowed), current.resolution_level + 1)
-    bounds = constraints.bounds_for_level(target_level)
-    if bounds is None:
-        return None
+    if current_level == 0 and 1 in constraints.allowed_resolution_levels:
+        bounds = constraints.bounds_for_level(1)
+        if bounds is not None:
+            return RequestedViewDto(
+                resolution_level=1,
+                center_x=int((bounds.minimum_center_x + bounds.maximum_center_x) // 2),
+                center_y=int((bounds.minimum_center_y + bounds.maximum_center_y) // 2),
+            )
 
-    # Coming from the full view there is only one legal centre to start from.
-    if current.resolution_level == 0:
-        centre_x = (bounds.minimum_center_x + bounds.maximum_center_x) // 2
-        centre_y = (bounds.minimum_center_y + bounds.maximum_center_y) // 2
-        return RequestedViewDto(
-            resolution_level=target_level,
-            center_x=int(centre_x),
-            center_y=int(centre_y),
-        )
+    if current_level == 1 and 2 in constraints.allowed_resolution_levels:
+        bounds = constraints.bounds_for_level(2)
+        if bounds is not None:
+            return RequestedViewDto(
+                resolution_level=2,
+                center_x=int(min(max(current.center_x, bounds.minimum_center_x), bounds.maximum_center_x)),
+                center_y=int(min(max(current.center_y, bounds.minimum_center_y), bounds.maximum_center_y)),
+            )
+
+    bounds = constraints.bounds_for_level(current_level)
+    if bounds is None or current_level == 0:
+        return None
 
     direction = _sweep_direction.setdefault(request.sequence_id, 1)
-
-    # Move as far as this response is allowed to, and no further. The limit
-    # belongs to the level the camera is on now, not the one we are going to.
-    limit = constraints.maximum_center_delta or MAXIMUM_CENTER_DELTA_PIXELS[
-        current.resolution_level
-    ]
-    step = int(limit * 0.9)
-
-    centre_x = current.center_x + direction * step
-    if centre_x > bounds.maximum_center_x or centre_x < bounds.minimum_center_x:
-        # Turn around at the edge and drop down a row.
-        direction = -direction
+    limit = max(1.0, constraints.maximum_center_delta)
+    step = max(1, int(limit * 0.8))
+    candidate_x = current.center_x + direction * step
+    if candidate_x > bounds.maximum_center_x or candidate_x < bounds.minimum_center_x:
+        direction *= -1
         _sweep_direction[request.sequence_id] = direction
-        centre_x = current.center_x + direction * step
-
-    centre_y = current.center_y
-
-    # Clamp into the legal window. int() matters: these fields are strict ints
-    # on the evaluator, so a float here is a validation error.
-    centre_x = int(min(max(centre_x, bounds.minimum_center_x), bounds.maximum_center_x))
-    centre_y = int(min(max(centre_y, bounds.minimum_center_y), bounds.maximum_center_y))
-
+        candidate_x = current.center_x + direction * step
+    candidate_x = int(min(max(candidate_x, bounds.minimum_center_x), bounds.maximum_center_x))
     return RequestedViewDto(
-        resolution_level=target_level,
-        center_x=centre_x,
-        center_y=centre_y,
+        resolution_level=current_level,
+        center_x=candidate_x,
+        center_y=int(min(max(current.center_y, bounds.minimum_center_y), bounds.maximum_center_y)),
     )
