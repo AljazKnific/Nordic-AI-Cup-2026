@@ -1,6 +1,7 @@
-# Transcripts and model weights you cache locally
+# Transcripts, captured model replies and model weights you cache locally
 transcripts/
 models/
+diagnostics/
 
 # Generic Python files (Source: https://github.com/github/gitignore/blob/main/Python.gitignore)
 __pycache__/

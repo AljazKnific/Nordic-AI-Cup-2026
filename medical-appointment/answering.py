@@ -16,6 +16,11 @@ tell you it happened.
 model named. A phrase repeated elsewhere in the conversation is therefore
 unmatchable, which is what stops a patient echoing the doctor from dragging the
 span to the wrong mention.
+
+**Sentences, not segments, are the unit we point at.** The ASR divides speech on
+silence, so its segments cut sentences in half and a span trimmed inside one is
+routinely half a passage. Once located, a span is rounded out to the sentences
+it lies in -- which may cross a segment boundary, though the *match* never does.
 """
 
 import json
@@ -23,7 +28,9 @@ import logging
 import os
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple,
+)
 
 from utils import Span
 
@@ -86,48 +93,185 @@ def segment_bounds(segment: Dict[str, Any]) -> Span:
     return (float(segment['start']), float(segment['end']))
 
 
-def resolve_span(segment: Dict[str, Any], quote: Optional[str]) -> Span:
-    """Narrow a segment to the quoted passage using its word timings.
+# Gold passages run a median of 2.9 s and are written as sentences, while the
+# ASR divides speech into ~3 s segments that cut sentences in half: 68 of the
+# 195 annotated passages cross a segment boundary. Pointing at whole segments is
+# worth only 0.521 mean tIoU where whole sentences are worth 0.708 and runs of
+# them 0.815, so the unit we return is the sentence, not the segment and not the
+# model's quote. The quote says *where*; the sentences say *how far*.
+#
+# This lets a span cross a segment boundary, which the segment-scoped *match*
+# never does. The two are different things. The quote is still matched only
+# inside the segment the model named, so a phrase repeated elsewhere in the
+# conversation still cannot drag the span to the wrong mention; all this does is
+# stop the segment boundary truncating the sentence the match landed in.
+_SENTENCE_END = ('.', '?', '!')
 
-    Falls back to the segment's own bounds whenever the quote is missing, does
-    not match, or matches something implausibly long. The fallback is never
-    ``None``: a loose span still scores, and ``None`` cannot.
+# A sentence merely abutting the span is not part of it.
+_TOUCH_SECONDS = 0.05
+
+# No real sentence runs this long: the longest across the 39 supplied
+# conversations is 8.6 s and the 99th percentile is 5.9 s. A "sentence" past
+# this is the ASR having emitted no punctuation, and rounding a span out to one
+# would hand back most of the conversation -- far worse than the segment we
+# started from. So past this we keep the span we were given.
+MAX_PASSAGE_SECONDS = 15.0
+
+# A model asked to quote what it read hands back the sentence it was reading and
+# often its neighbours, so among the sentences a span touches we prefer the ones
+# carrying the question's own terms, discounting candidates that run well past
+# the length of a typical passage. Measured over a broad plateau -- anything in
+# 0.1-0.35 against a 3-4 s target scores within 0.007 -- so these are not tuned
+# to an edge.
+TARGET_SECONDS = 3.5
+LENGTH_PENALTY = 0.2
+
+# Too common to say anything about which sentence answers a question. Kept small
+# and generic on purpose: a medical lexicon here would be fitted to the 39
+# supplied conversations, and the evaluation drugs are unseen.
+_STOPWORDS = frozenset("""
+a an and are as at be been being but by did do does for from had has have he
+her him his how i if in into is it its me my not of on or our she should so
+that the their them then there these they this to too was we were what when
+which who will with would you your patient
+""".split())
+
+
+class Sentence(NamedTuple):
+    start: float
+    end: float
+    text: str
+
+
+def _content_words(text: str) -> set:
+    return {
+        word for word in _normalise(text).split()
+        if word not in _STOPWORDS and len(word) > 1
+    }
+
+
+def sentences_of(segments: Sequence[Dict[str, Any]]) -> List[Sentence]:
+    """The conversation's sentences, from the punctuation the ASR already emits.
+
+    Built from the word stream rather than per segment, because a sentence
+    routinely runs across a segment boundary -- which is most of why segment
+    bounds localise so poorly.
+    """
+    found: List[Sentence] = []
+    current: List[Dict[str, Any]] = []
+    for segment in segments:
+        for word in _words_of(segment):
+            current.append(word)
+            if str(word.get('word', '')).rstrip().endswith(_SENTENCE_END):
+                found.append(_sentence(current))
+                current = []
+    if current:
+        found.append(_sentence(current))
+    return found
+
+
+def _sentence(words: Sequence[Dict[str, Any]]) -> Sentence:
+    return Sentence(
+        float(words[0]['start']),
+        float(words[-1]['end']),
+        ' '.join(str(word.get('word', '')) for word in words),
+    )
+
+
+def _overlap(span: Span, sentence: Sentence) -> float:
+    return min(span[1], sentence.end) - max(span[0], sentence.start)
+
+
+def to_passage(
+    span: Span, sentences: Sequence[Sentence], question: Optional[str] = None,
+) -> Span:
+    """Round a located span out to the sentences that carry the answer.
+
+    Every span we return goes through here, so what we point at is always a
+    whole number of sentences. Returns the span untouched when it lies in no
+    sentence at all, or when the sentences it lies in are too long to be real --
+    both of which mean the ASR emitted no usable punctuation here.
+    """
+    touched = [s for s in sentences if _overlap(span, s) > _TOUCH_SECONDS]
+    if not touched:
+        return span
+
+    whole = (touched[0].start, touched[-1].end)
+    asked = _content_words(question) if question else set()
+    if not asked or len(touched) < 2:
+        return _plausible(whole, span)
+
+    best: Optional[Tuple[float, Span]] = None
+    for first in range(len(touched)):
+        for last in range(first, len(touched)):
+            candidate = (touched[first].start, touched[last].end)
+            shared = len(asked & _content_words(
+                ' '.join(s.text for s in touched[first:last + 1])))
+            score = shared - LENGTH_PENALTY * max(
+                0.0, (candidate[1] - candidate[0]) - TARGET_SECONDS)
+            if best is None or score > best[0] + 1e-9:
+                best = (score, candidate)
+    return _plausible(best[1] if best else whole, span)
+
+
+def _plausible(passage: Span, span: Span) -> Span:
+    """The rounded-out passage, unless it is too long to be one."""
+    if passage[1] - passage[0] > MAX_PASSAGE_SECONDS:
+        logger.info('FALLBACK sentence longer than %.0f s; keeping the located span',
+                    MAX_PASSAGE_SECONDS)
+        return span
+    return passage
+
+
+def resolve_span(
+    segment: Dict[str, Any],
+    quote: Optional[str],
+    sentences: Sequence[Sentence] = (),
+    question: Optional[str] = None,
+) -> Span:
+    """Locate the passage a quote was read off, inside one named segment.
+
+    The quote is matched only within ``segment`` -- that is what stops a phrase
+    repeated elsewhere dragging the span to the wrong mention -- and the match is
+    then rounded out to whole sentences by :func:`to_passage`. Falls back to the
+    segment's own bounds whenever the quote is missing or does not match. The
+    fallback is never ``None``: a loose span still scores, and ``None`` cannot.
     """
     words = _words_of(segment)
-    if not quote or not words:
-        return segment_bounds(segment)
+    wanted = _normalise(quote).split() if quote else []
+    span: Optional[Span] = None
 
-    wanted = _normalise(quote).split()
-    if not wanted:
-        return segment_bounds(segment)
+    if words and wanted:
+        spoken = [_normalise(word['word']) for word in words]
 
-    spoken = [_normalise(word['word']) for word in words]
-
-    # Longest run of the quote that appears contiguously in the segment. A model
-    # that drops or adds a word at either end should still localise.
-    best: Optional[Tuple[int, int]] = None
-    for length in range(len(wanted), 0, -1):
-        for offset in range(len(wanted) - length + 1):
-            needle = wanted[offset:offset + length]
-            for start in range(len(spoken) - length + 1):
-                if spoken[start:start + length] == needle:
-                    best = (start, start + length - 1)
+        # Longest run of the quote appearing contiguously in the segment. A
+        # model that drops or adds a word at either end should still localise.
+        best: Optional[Tuple[int, int]] = None
+        for length in range(len(wanted), 0, -1):
+            for offset in range(len(wanted) - length + 1):
+                needle = wanted[offset:offset + length]
+                for start in range(len(spoken) - length + 1):
+                    if spoken[start:start + length] == needle:
+                        best = (start, start + length - 1)
+                        break
+                if best:
                     break
             if best:
                 break
-        if best:
-            break
 
-    if best is None:
-        # Counted, not silenced: how often this fires is the measurement that
-        # says whether the quote path is worth keeping.
-        logger.info('FALLBACK quote-unmatched in segment %s: %r', segment['index'], quote)
-        return segment_bounds(segment)
+        if best is None:
+            # Counted, not silenced: how often this fires is the measurement
+            # that says whether the quote path is worth keeping.
+            logger.info('FALLBACK quote-unmatched in segment %s: %r',
+                        segment['index'], quote)
+        else:
+            candidate = (float(words[best[0]]['start']), float(words[best[1]]['end']))
+            if candidate[1] > candidate[0]:
+                span = candidate
 
-    span = (float(words[best[0]]['start']), float(words[best[1]]['end']))
-    if span[1] <= span[0]:
-        return segment_bounds(segment)
-    return span
+    if span is None:
+        span = segment_bounds(segment)
+    return to_passage(span, sentences, question)
 
 
 def _find_segment(segments: Sequence[Dict[str, Any]], index: Any) -> Optional[Dict[str, Any]]:
@@ -207,6 +351,7 @@ def answer_conversation(
         return [(True, None) for _ in questions]
 
     header = build_transcript_header(segments)
+    sentences = sentences_of(segments)
     results: List[Tuple[bool, Optional[Span]]] = []
     started = time.perf_counter()
 
@@ -215,7 +360,8 @@ def answer_conversation(
             logger.warning('FALLBACK past the %.0f s deadline; guessing: %s',
                            DEADLINE_SECONDS, question)
             segment = _best_keyword_segment(segments, question)
-            results.append((True, segment_bounds(segment)))
+            results.append(
+                (True, to_passage(segment_bounds(segment), sentences, question)))
             continue
 
         try:
@@ -236,6 +382,6 @@ def answer_conversation(
             logger.info('FALLBACK no usable segment index (%r) for: %s', index, question)
             segment = _best_keyword_segment(segments, question)
 
-        results.append((True, resolve_span(segment, quote)))
+        results.append((True, resolve_span(segment, quote, sentences, question)))
 
     return results

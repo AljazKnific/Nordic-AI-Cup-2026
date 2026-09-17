@@ -223,3 +223,78 @@ class TestSharedPrefix:
         assert '[3]' in header
         assert '20.0' in header
         assert 'Doctor Norgaard' in header
+
+
+@pytest.fixture
+def punctuated():
+    """Segments whose sentences run across the segment boundary.
+
+    Segment 0 ends mid-sentence and segment 1 finishes it, which is the ordinary
+    case: the ASR divides on silence, not on syntax.
+    """
+    return [
+        segment(0, 0.0, 4.0, 'Good morning. Your chest and heart'),
+        segment(1, 4.0, 8.0, 'both sound normal. Nothing abnormal to report.'),
+        segment(2, 8.0, 14.0, 'Sporinox. One hundred milligrams daily for two weeks. '
+                              'Take it after a meal.'),
+    ]
+
+
+class TestPassages:
+    """The span we return is a whole number of sentences, not a quote or a segment."""
+
+    def test_a_quote_is_widened_to_the_sentence_containing_it(self, punctuated):
+        answerer = replies(reply('yes', 2, 'after a meal'))
+        [(_, span)] = answer_conversation(punctuated, ['Is it taken after a meal?'], answerer)
+
+        # 'Take it after a meal.' starts before the quoted words do.
+        sentence_start = punctuated[2]['words'][-5]['start']
+        assert span == (sentence_start, 14.0)
+
+    def test_a_sentence_split_across_two_segments_is_returned_whole(self, punctuated):
+        """The point of the change: the segment boundary must not truncate it."""
+        answerer = replies(reply('yes', 1, 'both sound normal'))
+        [(_, span)] = answer_conversation(
+            punctuated, ['Is the heart normal?'], answerer)
+
+        # 'Your chest and heart both sound normal.' begins in segment 0.
+        assert span[0] < 4.0 < span[1]
+
+    def test_the_sentence_carrying_the_question_terms_is_chosen(self, punctuated):
+        """A quote spanning several sentences is narrowed, not just widened."""
+        answerer = replies(reply(
+            'yes', 2, 'Sporinox. One hundred milligrams daily for two weeks. '
+                      'Take it after a meal.'))
+        [(_, span)] = answer_conversation(
+            punctuated, ['Is the daily dose one hundred milligrams?'], answerer)
+
+        assert span[1] - span[0] < 6.0
+        assert span[0] >= punctuated[2]['words'][1]['start']
+
+    def test_the_quote_is_still_matched_only_inside_the_named_segment(self, punctuated):
+        """Widening must not reintroduce conversation-wide matching."""
+        answerer = replies(reply('yes', 0, 'after a meal'))
+        [(_, span)] = answer_conversation(
+            punctuated, ['Is it taken after a meal?'], answerer)
+
+        # Those words are only in segment 2, so segment 0 cannot match them and
+        # the span must stay where the model pointed.
+        assert span[0] < 8.0
+
+    def test_an_unpunctuated_transcript_does_not_widen_to_the_whole_conversation(self):
+        """No punctuation means no sentences; a 40 s 'sentence' is not one."""
+        unpunctuated = [
+            segment(0, 0.0, 20.0, ' '.join(f'word{i}' for i in range(20))),
+            segment(1, 20.0, 40.0, ' '.join(f'other{i}' for i in range(20))),
+        ]
+        answerer = replies(reply('yes', 1, 'other3 other4 other5'))
+        [(_, span)] = answer_conversation(unpunctuated, ['q?'], answerer)
+
+        assert span[1] - span[0] < 10.0
+
+    def test_a_yes_still_never_returns_a_null_span(self, punctuated):
+        answerer = replies(reply('yes', None, None))
+        [(answer, span)] = answer_conversation(punctuated, ['q?'], answerer)
+
+        assert answer is True
+        assert span is not None
