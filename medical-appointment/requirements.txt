@@ -6,5 +6,12 @@ fastapi>=0.115            # [0.127.0]
 uvicorn>=0.30             # [0.40.0]
 pydantic>=2.7,<3          # [2.12.5]
 
-# Only needed by local_evaluator.py.
+# local_evaluator.py, and the Ollama client in the request path.
 requests>=2.31            # [2.32.5]
+
+# The solution itself. Local only: no cloud API is allowed in the request path.
+faster-whisper>=1.1       # [1.2.1]  ASR with word-level timestamps
+numpy>=1.26               # [2.x]    warm-up buffer
+
+# Dev only.
+pytest>=8                 # [9.1.1]
