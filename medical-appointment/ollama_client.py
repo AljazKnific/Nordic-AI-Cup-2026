@@ -31,6 +31,12 @@ MAX_TOKENS = 160
 # from a truncated transcript looks like a model failure, not a config one.
 CONTEXT_TOKENS = int(os.environ.get('OLLAMA_NUM_CTX', '16384'))
 
+# Ollama unloads an idle model after about five minutes. Waiting in a
+# validation queue is exactly that kind of idle, and the reload would be paid
+# by the first scored request -- the one with the least budget to spare. Pin
+# the model in memory for the duration instead.
+KEEP_ALIVE = os.environ.get('OLLAMA_KEEP_ALIVE', '60m')
+
 
 def answer(prompt: str) -> str:
     """Send one prompt, return the model's raw reply text."""
@@ -42,6 +48,7 @@ def answer(prompt: str) -> str:
             'prompt': prompt,
             'stream': False,
             'think': False,
+            'keep_alive': KEEP_ALIVE,
             'options': {
                 'temperature': 0.0,
                 'num_predict': MAX_TOKENS,
@@ -72,7 +79,7 @@ def warm_up() -> None:
         requests.post(
             f'{HOST}/api/generate',
             json={'model': MODEL, 'prompt': 'ok', 'stream': False,
-                  'think': False,
+                  'think': False, 'keep_alive': KEEP_ALIVE,
                   'options': {'num_predict': 1, 'num_ctx': CONTEXT_TOKENS}},
             timeout=TIMEOUT_SECONDS,
         )
