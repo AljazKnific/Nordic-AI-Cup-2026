@@ -10,6 +10,7 @@ wrong — ten marks, not one. Nothing in here may raise.
 """
 
 import logging
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -20,6 +21,13 @@ from utils import audio_duration_seconds, decode_audio
 logger = logging.getLogger(__name__)
 
 Transcriber = Callable[[bytes], List[Dict[str, Any]]]
+
+# The evaluator allows 60 s. Stop answering here instead, so the reply is on the
+# wire before the budget expires: transcription is ~70% of the cost and scales
+# with audio length, so on a long conversation or a slow host there may be very
+# little left. A guessed answer is worth half a mark; a timeout is worth nothing
+# and five in a row end the attempt.
+REQUEST_BUDGET_SECONDS = float(os.environ.get('REQUEST_BUDGET', '50'))
 
 
 def predict(
@@ -48,7 +56,10 @@ def predict(
         transcription_seconds = time.perf_counter() - transcription_started
 
         answering_started = time.perf_counter()
-        results = answer_conversation(segments, questions, answerer)
+        results = answer_conversation(
+            segments, questions, answerer,
+            deadline=started + REQUEST_BUDGET_SECONDS,
+        )
         answering_seconds = time.perf_counter() - answering_started
     except Exception:
         # Whatever went wrong, a guess for every question beats no reply at all:

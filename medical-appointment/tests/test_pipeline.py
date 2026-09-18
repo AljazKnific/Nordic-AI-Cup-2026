@@ -87,6 +87,35 @@ class TestContract:
         validate_response(response, expected_count=1)
 
 
+class TestBudget:
+    """A late reply is worth nothing; a poor one on time is worth half a mark."""
+
+    def test_slow_transcription_leaves_the_answerer_no_time_and_we_still_reply(self, segments):
+        import pipeline
+
+        asked = []
+
+        def slow_transcribe(audio_bytes):
+            # Stands in for a long conversation eating the whole budget in ASR.
+            pipeline.REQUEST_BUDGET_SECONDS = -1.0
+            return segments
+
+        def answerer(prompt):
+            asked.append(prompt)
+            return 'no'
+
+        original = pipeline.REQUEST_BUDGET_SECONDS
+        try:
+            response = predict(request(), slow_transcribe, answerer)
+        finally:
+            pipeline.REQUEST_BUDGET_SECONDS = original
+
+        validate_response(response, expected_count=10)
+        assert asked == []                      # the model was never called
+        assert all(response.answers)            # every question still answered
+        assert all(s is not None for s in response.evidence_start)
+
+
 class TestNeverSilent:
     """Any reply beats none: five consecutive timeouts end the whole attempt."""
 

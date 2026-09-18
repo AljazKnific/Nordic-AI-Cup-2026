@@ -340,6 +340,7 @@ def answer_conversation(
     segments: Sequence[Dict[str, Any]],
     questions: Sequence[str],
     answerer: Answerer,
+    deadline: Optional[float] = None,
 ) -> List[Tuple[bool, Optional[Span]]]:
     """Answer every question about one conversation, with a span for each yes.
 
@@ -353,12 +354,15 @@ def answer_conversation(
     header = build_transcript_header(segments)
     sentences = sentences_of(segments)
     results: List[Tuple[bool, Optional[Span]]] = []
-    started = time.perf_counter()
+    # An absolute deadline from the caller accounts for time already spent on
+    # transcription, which is the larger and more variable half. Without one,
+    # fall back to a budget for answering alone.
+    if deadline is None:
+        deadline = time.perf_counter() + DEADLINE_SECONDS
 
     for question in questions:
-        if time.perf_counter() - started > DEADLINE_SECONDS:
-            logger.warning('FALLBACK past the %.0f s deadline; guessing: %s',
-                           DEADLINE_SECONDS, question)
+        if time.perf_counter() > deadline:
+            logger.warning('FALLBACK past the deadline; guessing: %s', question)
             segment = _best_keyword_segment(segments, question)
             results.append(
                 (True, to_passage(segment_bounds(segment), sentences, question)))
