@@ -1,0 +1,16 @@
+# Dev-only and heavy. The ASR weights are fetched during the build instead, so
+# the build context stays small and the image works on any architecture.
+.venv/
+models/
+transcripts/
+diagnostics/
+data/
+tests/
+tools/
+docs/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc
+local_evaluator.py
+pytest.ini

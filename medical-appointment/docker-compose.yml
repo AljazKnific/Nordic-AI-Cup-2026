@@ -1,0 +1,60 @@
+# Two services, because Ollama is a server rather than a library. The API
+# container holds the ASR weights; the Ollama container holds the answering
+# model in a named volume, so it survives a rebuild of either image.
+#
+#   docker compose up --build       first run pulls qwen3:14b (~9 GB, once)
+#   curl localhost:9054/api         readiness
+#
+# Submit the URL with its path: http://<host>:9054/predict
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    # Not published to the host: only the api service needs to reach it, and
+    # an open inference port on a public VM is an invitation.
+    expose:
+      - "11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  model-puller:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    # Pulls once, then exits. The volume keeps it for every later start.
+    entrypoint: ["sh", "-c", "ollama pull ${OLLAMA_MODEL:-qwen3:14b}"]
+    restart: "no"
+
+  api:
+    build: .
+    depends_on:
+      model-puller:
+        condition: service_completed_successfully
+    ports:
+      - "9054:9054"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:14b}
+      # A 14B model needs this much context for a transcript prompt; Ollama
+      # would otherwise default to 4096 and silently truncate the conversation.
+      OLLAMA_NUM_CTX: "16384"
+      # Stop answering and guess at this point, so a slow host degrades into
+      # poor answers rather than into silence. Five consecutive timeouts end
+      # an attempt outright.
+      ANSWER_DEADLINE: "35"
+    restart: unless-stopped
+
+volumes:
+  ollama-models:
