@@ -5,15 +5,22 @@ Written for a session that has no memory of how any of this came about. Read
 
 ## Where things stand
 
-**Local score 0.745** over the 39 supplied conversations — accuracy 0.990, mean
-tIoU 0.581. The floor is 0.200. `Score = 0.4 x Accuracy + 0.6 x mean tIoU`, so
+**Local score 0.759** over the 39 supplied conversations — accuracy 0.990, mean
+tIoU 0.605. The floor is 0.200. `Score = 0.4 x Accuracy + 0.6 x mean tIoU`, so
 evidence is the larger half and is where all remaining points are.
+
+**That number is from a full attempt through the live endpoint**, not from the
+offline harness: 39 conversations, 390 questions, uncached, one POST each. No
+timeouts, no failed conversations, no unanswered question. **29.5 s mean per
+conversation, 45.3 s at worst — 76% of the 60 s budget** (`conversation_sample_20.mp3`,
+29.8 s of it transcription). The log is `diagnostics/e2e_after.log`, which is gitignored: re-run
+`local_evaluator.py` to regenerate it.
 
 **On the hosted validation set the score was 0.59**, because three of nineteen
 conversations exceeded the 60 s budget and a timeout costs all ten of its marks.
-Both causes are now fixed (threading, then a transcription deadline) but **the
-result of a validation run with both fixes in place is not yet known**. Getting
-that number is the first thing to do.
+Both causes are fixed, and the fixes now have an end-to-end run behind them.
+**The hosted number itself is still unknown** — only a submission can produce it,
+and that is the one thing left that this machine cannot do.
 
 Work lives on branch `aljaz-medical`, pushed to the `fork` remote
 (`AljazKnific/Nordic-AI-Cup-2026`). `origin` is the team repo and is read-only
@@ -29,70 +36,86 @@ for this account. Local `main` is stale at 0.692.
 | 6 | **Declined with evidence** — see below |
 | — | Containerised (`Dockerfile`, `docker-compose.yml`, `docs/deploy.md`) |
 | — | Timeout fixes: host-wide ASR threads, whole-request budget, transcription deadline |
+| A, 8 | Attempt readiness: all 39 through the live endpoint, clean. Numbers above |
+| 7 | Mention selection: sentence choice shipped (0.745 -> 0.759); segment choice **declined with evidence** — see below |
 
-Ticket 6 (matching question terms against garbled transcript words) was declined
-deliberately: all four wrong answers across 390 questions are garbled drug names,
-worth about +0.01, but the same mechanism would let a **decoy term** match, and
-hard negatives are currently perfect at 1.000 over 142 questions. Ten points of
-upside against 140 of exposure. Do not rebuild it without new evidence.
+## Declined, with the evidence
+
+**Ticket 6 — matching question terms against garbled transcript words.** All four
+wrong answers across 390 questions are garbled drug names, worth about +0.01, but
+the same mechanism would let a **decoy term** match, and hard negatives are
+currently perfect at 1.000 over 142 questions. Ten points of upside against 140 of
+exposure. Do not rebuild it without new evidence.
+
+**Ticket 7's second half — asking the model for the last mention.** Of the tIoU
+still missing, 0.067 sits behind the model naming a segment that does not hold the
+annotated passage. The pattern in those failures is that the fact is stated twice,
+the patient first and the doctor in confirmation, and the annotation is usually on
+the later one. A prompt that says so — *"if the consultation states the answer more
+than once, name the last segment where it is stated"* — was captured over the same
+39 conversations (`diagnostics/replies_last_mention.json`) and **lost**:
+
+| prompt | accuracy | mean tIoU | score |
+| --- | --- | --- | --- |
+| current | 0.990 | 0.605 | **0.759** |
+| last mention | 0.990 | 0.569 | 0.737 |
+
+It made the thing it targeted worse, not better: wrong-mention loss rose from 0.067
+to 0.090. The model's own choice of mention is better than the heuristic, and the
+apparent "later is annotated" pattern does not survive contact with the cases where
+it is not. Reproduce with `tools/replay.py --replies diagnostics/replies_last_mention.json`
+if that capture is still on the machine — `diagnostics/` is gitignored, so on a
+fresh clone it costs another 10-minute capture with the sentence above added to
+`TASK` in `answering.py`.
+
+An asymmetric reach — letting a passage extend further forward than back, on the
+same theory — was also measured and is worth +0.002 tIoU with a bootstrap interval
+straddling zero. Not shipped.
 
 ## Still to do
 
-### A: Re-run validation and read the result
+### 10: Submit, and merge
 
-**Blocked by:** None. Do this first.
+**Blocked by:** None.
 
-Three timeouts cost ~0.12 of score; one remained after the first fix and should
-now be gone. Until a clean validation run exists, nobody knows whether the
-remaining gap is modelling or infrastructure — and the answer decides whether
-ticket 7 is worth starting.
+The only number nobody can produce on this machine is the hosted one. Everything
+that cost the last attempt 0.12 of score is fixed and has a clean end-to-end run
+behind it; what remains is to submit and read the result.
 
-- [ ] A validation run completes with no conversation exceeding 60 s
-- [ ] The score is recorded here
-
-### 7: Mention selection
-
-**Blocked by:** A
-
-The only remaining modelling work, and larger than the backlog first estimated.
-The diagnostic attributes **0.093 of tIoU** to the model naming a segment that
-does not hold the annotated mention, and a further **0.091** to choosing the
-wrong sentences among those the named segment does hold. 118 of 195 questions
-are already the best their named segment allows, so the work is in choosing
-*which mention*, not in span mechanics.
-
-Iterate with `tools/replay.py` (frozen replies, scores in under a second).
-Changing which segment the model *names* needs new replies, so that part costs a
-fresh 12-minute `tools/capture_replies.py` run.
-
-- [ ] Both variants scored over the same 39 conversations
-- [ ] Ships only if it wins; the losing number recorded either way
-
-### 8: Attempt readiness
-
-**Blocked by:** A
-
-Never done end to end. Would have caught the timeouts before the hosted run did.
-
-- [ ] All 39 through the live server via `local_evaluator.py`, uncached
-- [ ] Mean time per conversation recorded, and the slowest named
-- [ ] Confirmation that no failure mode produces silence rather than a guess
+- [ ] A hosted validation run, with the endpoint served under `caffeinate`
+- [ ] The hosted score recorded here, beside the local 0.759
+- [ ] A PR from `fork/aljaz-medical` to the team repo, or write access on `origin`.
+      Note the fork is public
 
 ### 9: Azure sizing, if deploying
 
 **Blocked by:** None, but only matters if the endpoint moves off the Mac.
 
-The container is built and verified; sizing is not. Every timing is from an M4
-Pro. A CPU-only Azure VM will be slower and will reintroduce timeouts. See
-`docs/deploy.md` — a GPU VM keeps the models, and everything else is an
-environment variable.
+The container is built and verified; sizing is not, and cannot be from here. Every
+timing above is an M4 Pro. A CPU-only Azure VM will be slower and will reintroduce
+timeouts — at 45.3 s worst case, the headroom is 14.7 s. `docs/deploy.md` has the
+levers in the order worth trying; a GPU VM keeps the models and everything else is
+an environment variable.
 
-### 10: Merge
+### 11: Mention selection, if anyone returns to modelling
 
-**Blocked by:** A
+**Blocked by:** Nothing, but read the declined note above first.
 
-Open a PR from `fork/aljaz-medical` to the team repo, or get write access on
-`origin`. Note the fork is public.
+What is left after the sentence work, attributed by `tools/replay.py --diagnose`:
+
+| cause | n | recoverable tIoU |
+| --- | --- | --- |
+| wrong-sentences | 49 | 0.114 |
+| wrong-mention | 33 | 0.067 |
+| answered-no | 4 | 0.019 |
+| best-available | 109 | 0.000 |
+
+Two of those are dead ends already paid for: `answered-no` is ticket 6, and the
+prompt route into `wrong-mention` is the table above. `wrong-sentences` is the one
+with headroom left, and it is honest headroom — the passage was reachable from the
+segment the model named and we chose the wrong sentences inside it. Iterate with
+`tools/replay.py` (frozen replies, under a second); only a change to which segment
+the model *names* needs a fresh 10-minute capture.
 
 ## Numbers worth not re-deriving
 
@@ -113,18 +136,21 @@ bias — only finer timestamps (WhisperX forced alignment) would raise it, and
 that should be measured with `--ceiling-words` before any of it is built.
 Accuracy is worth +0.004 in total; do not spend time there.
 
-Timing, on an M4 Pro: ~33 s per conversation end to end, ~48 s worst case on the
-longest supplied audio, against a 60 s budget that is an **average across the
-whole attempt**.
+Timing, on an M4 Pro, measured over a whole 39-conversation attempt through the
+live endpoint: **29.5 s mean, 45.3 s worst** against a 60 s budget that is an
+**average across the whole attempt**. Transcription is the variable half — 29.8 s
+of that worst case — and answering is steady at 1.1-1.5 s per question once the
+shared prefix is warm.
 
 ## Running it
 
 ```
-./.venv/bin/python -m pytest              # 34 tests, no model needed
+./.venv/bin/python -m pytest              # 36 tests, no model needed
 ./.venv/bin/python tools/score.py         # full score, ~12 min, buffers output
 ./.venv/bin/python tools/score.py --limit 5
 ./.venv/bin/python tools/replay.py        # frozen replies, seconds
 ./.venv/bin/python tools/replay.py --diagnose
+./.venv/bin/python local_evaluator.py     # a whole attempt through the live server, ~20 min
 caffeinate -dimsu ./.venv/bin/python api.py
 ```
 
@@ -142,5 +168,8 @@ Traps that have each cost real time:
   while accuracy did not move at all. Judge every change by tIoU.
 - Batched inference gives no speedup on CPU and collapses segments; VAD does
   nothing here. Both were measured and rejected.
+- Python caches bytecode on mtime **and size**, so an edit that changes neither
+  (flipping a constant back after a experiment, say) runs the stale `.pyc` and
+  quietly reports the old numbers. Clear `__pycache__` after any such edit.
 - The Mac is set to sleep after 1 minute. Run the server under `caffeinate`, or
   the endpoint vanishes mid-attempt and silence ends it.
