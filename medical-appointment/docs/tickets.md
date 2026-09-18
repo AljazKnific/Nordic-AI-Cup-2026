@@ -1,169 +1,146 @@
-# Backlog
+# Backlog and handoff
 
-Tickets 1-3 are done (commit 94408e8). What follows is the remaining work, in
-dependency order. Blocking edges are real: a ticket whose blockers are unfinished
-cannot be measured, only guessed at.
+Written for a session that has no memory of how any of this came about. Read
+`CONTEXT.md` for the vocabulary and `docs/adr/0001` before touching a prompt.
 
-Baseline to beat, measured over all 39 supplied conversations:
+## Where things stand
 
-| | mean tIoU | score |
-| --- | --- | --- |
-| Pipeline before ticket 4 | 0.493 | 0.692 |
-| Segment bounds only (ceiling) | 0.521 | 0.713 |
-| **Pipeline after ticket 4** | **0.581** | **0.745** |
-| Whole sentences (ceiling, runs of up to 4) | 0.815 | 0.889 |
-| Word-level trimming (ceiling) | 0.928 | 0.957 |
+**Local score 0.745** over the 39 supplied conversations — accuracy 0.990, mean
+tIoU 0.581. The floor is 0.200. `Score = 0.4 x Accuracy + 0.6 x mean tIoU`, so
+evidence is the larger half and is where all remaining points are.
 
-Accuracy is unchanged at 0.990 throughout; every point moved is evidence.
+**On the hosted validation set the score was 0.59**, because three of nineteen
+conversations exceeded the 60 s budget and a timeout costs all ten of its marks.
+Both causes are now fixed (threading, then a transcription deadline) but **the
+result of a validation run with both fixes in place is not yet known**. Getting
+that number is the first thing to do.
 
-Accuracy is 0.990 and is not the problem. Every remaining point of consequence
-is in the evidence half.
+Work lives on branch `aljaz-medical`, pushed to the `fork` remote
+(`AljazKnific/Nordic-AI-Cup-2026`). `origin` is the team repo and is read-only
+for this account. Local `main` is stale at 0.692.
 
----
+## Done
 
-## 4: Make quote trimming actually beat segment bounds
+| | |
+| --- | --- |
+| 1-3 | Pipeline, offline scoring harness, Ollama client |
+| 4 | Span trimming: spans round out to whole sentences. 0.692 -> 0.745 |
+| 5 | Error analysis (`tools/errors.py`) |
+| 6 | **Declined with evidence** — see below |
+| — | Containerised (`Dockerfile`, `docker-compose.yml`, `docs/deploy.md`) |
+| — | Timeout fixes: host-wide ASR threads, whole-request budget, transcription deadline |
 
-**Blocked by:** None (can start immediately)
+Ticket 6 (matching question terms against garbled transcript words) was declined
+deliberately: all four wrong answers across 390 questions are garbled drug names,
+worth about +0.01, but the same mechanism would let a **decoy term** match, and
+hard negatives are currently perfect at 1.000 over 142 questions. Ten points of
+upside against 140 of exposure. Do not rebuild it without new evidence.
 
-**What to build:** Evidence spans that are worth more than pointing at whole ASR
-segments. The mechanism exists — the answering model names a segment and quotes
-what it read, and `resolve_span` matches that quote against word timings inside
-that segment — but it currently scores 0.493 against a 0.521 segment-bounds
-ceiling, so it is not yet earning its place. The word-level ceiling is 0.928,
-so the headroom is roughly +0.26 of final score.
+## Still to do
 
-Diagnose before changing anything: for each annotated yes question, compare the
-predicted span against the gold span and against what the best word run in the
-named segment would have scored. That separates three different failures —
-the model naming the wrong segment, the quote failing to match, and the quote
-matching but covering the wrong words.
+### A: Re-run validation and read the result
 
-**Acceptance criteria:**
-- [x] A diagnostic exists that attributes each lost point to one of those three causes
-- [x] Mean tIoU over all 39 conversations beats 0.521
-- [x] The quote is still matched only inside the named segment
-- [x] Prompts still open with a byte-identical transcript header (ADR-0001)
-- [x] Tests at the `answer_conversation` seam cover any new behaviour
+**Blocked by:** None. Do this first.
 
-**Done.** `tools/capture_replies.py` records one real model reply per question
-once; `tools/replay.py` then scores any span change against them in a second
-instead of twelve minutes, and `--diagnose` does the attribution.
+Three timeouts cost ~0.12 of score; one remained after the first fix and should
+now be gone. Until a clean validation run exists, nobody knows whether the
+remaining gap is modelling or infrastructure — and the answer decides whether
+ticket 7 is worth starting.
 
-What it found: none of the three suspected causes was the main one. The quote
-fails to match its segment **once in 390 questions**. The model names a usable
-segment almost always. What was actually wrong is that the unit was wrong --
-the ASR divides speech into ~3 s segments that cut sentences in half, and 68 of
-the 195 annotated passages cross a segment boundary, so a span trimmed to the
-quote inside one segment is routinely half a sentence. Pointing at whole
-segments is worth 0.521; whole sentences are worth 0.708 and contiguous runs of
-them 0.815.
+- [ ] A validation run completes with no conversation exceeding 60 s
+- [ ] The score is recorded here
 
-So the span is now rounded out to the **sentences** the quote lies in, taken
-from the punctuation the ASR already puts on its word tokens. The quote is
-still matched only inside the named segment; only the widening crosses the
-boundary, which cannot pull the span to a different mention.
+### 7: Mention selection
 
-## 5: Error analysis pass
+**Blocked by:** A
 
-**Blocked by:** None (can start immediately)
+The only remaining modelling work, and larger than the backlog first estimated.
+The diagnostic attributes **0.093 of tIoU** to the model naming a segment that
+does not hold the annotated mention, and a further **0.091** to choosing the
+wrong sentences among those the named segment does hold. 118 of 195 questions
+are already the best their named segment allows, so the work is in choosing
+*which mention*, not in span mechanics.
 
-**What to build:** A readout of what is actually wrong, rather than a single
-score. The pipeline already logs every fallback with a `FALLBACK` prefix; this
-turns those and the per-question results into counts.
+Iterate with `tools/replay.py` (frozen replies, scores in under a second).
+Changing which segment the model *names* needs new replies, so that part costs a
+fresh 12-minute `tools/capture_replies.py` run.
 
-**Acceptance criteria:**
-- [x] Accuracy broken down by question type, with the specific questions that failed
-- [x] A count of how often each fallback layer fires across the 39 conversations
-- [x] A count of how often a dose, number or drug name is transcribed wrong
-- [x] A written conclusion on whether ticket 6 is worth building
-
-**Done**, as `tools/errors.py`. Findings over all 39 conversations:
-
-| question type | correct | n |
-| --- | --- | --- |
-| positive | 0.979 | 195 |
-| hard_negative | 1.000 | 142 |
-| off_topic | 1.000 | 53 |
-
-Every wrong answer is a positive answered *no*, and there are four of them:
-`sample_5_yes_q04` (Activelle), `sample_19_yes_q02` (Esomeprazole),
-`sample_19_yes_q03` (Airomir), `sample_82_yes_q01` (molluscs).
-
-Fallback layers over the same 390 questions: `quote-unmatched` fires **once**,
-and no other layer fires at all. The quote path is not where anything is being
-lost. The deadline and answerer-exception layers cannot fire in a replay and
-did not fire in the live run either.
-
-Entities: of 31 drug names and numbers named by positive questions, 10 are not
-spelled the same in the transcript and 4 of those have a near-match, which is
-ASR garbling -- Esomeprazole heard as "Isameprosol", Airomir as "Aromere",
-Ibumetin as "Ibumet", Panodil as "Panadil".
-
-## 6: Question-vocabulary entity matching
-
-**Blocked by:** 5
-
-**What to build:** Match entities named in a conversation's own ten questions
-against garbled transcript text, so an unseen drug name spelled correctly in the
-question can be recognised in an imperfect transcript.
-
-Use the question terms **only after ASR**, never as hotwords or `initial_prompt`.
-Hard-negative questions carry decoy drug names by construction — Pantoprazole
-where Esomeprazole was spoken — so priming transcription with them risks
-corrupting the transcript the whole pipeline rests on. A bad match costs one
-question; a poisoned transcript costs the conversation.
-
-Do not build this unless ticket 5 shows entity errors are actually happening.
-
-**Decision after ticket 5: do not build.** The entity errors are real but they
-are rare and cheap, and the fix is dangerous in exactly the place the pipeline
-is currently perfect.
-
-Upside: three of the four wrong answers are a garbled drug name. Recovering all
-three is +0.008 accuracy and, because a positive answered *no* also scores a
-tIoU of 0, perhaps +0.011 mean tIoU -- about **+0.01 of final score**.
-
-Downside: the mechanism is fuzzy-matching a question's term against garbled
-transcript words, and a hard negative's decoy term is a near-miss on a real one
-by construction. The same matcher that maps Esomeprazole onto "Isameprosol" can
-map the decoy Pantoprazole onto it too, turning a correct *no* into a confident
-*yes*. That risk is spread over 142 hard negatives currently answered at 1.000.
-Ten points of upside against a hundred and forty of exposure is the wrong bet.
-
-Revisit only if hard-negative accuracy is ever measured with slack in it.
-
-**Acceptance criteria:**
-- [ ] No lexicon derived from the 39 training conversations (evaluation drugs are unseen)
-- [ ] Terms used only after transcription
-- [ ] Score over all 39 conversations does not regress
-
-## 7: A/B meaning-based mention selection
-
-**Blocked by:** 4
-
-**What to build:** When a fact is stated more than once, choose the mention by
-what the question means rather than taking the first match. Ceiling is about
-+0.046: only 15 of 195 annotated yes questions have a duplicate mention at all.
-
-Ship only if the A/B beats plain quoting. It is a fix for a problem that may not
-exist — check first whether the model already picks the annotated mention.
-
-**Acceptance criteria:**
 - [ ] Both variants scored over the same 39 conversations
-- [ ] Ships only if it wins, and the losing variant's number is recorded either way
+- [ ] Ships only if it wins; the losing number recorded either way
 
-## 8: Attempt readiness
+### 8: Attempt readiness
 
-**Blocked by:** 4
+**Blocked by:** A
 
-**What to build:** Evidence that the real path holds under the real rules.
-Budget is 60 s per conversation **averaged over the whole attempt**, not per
-request — being slow early takes marks off conversations that are then never
-sent. Five consecutive timeouts end an attempt outright, so silence is the worst
-possible failure.
+Never done end to end. Would have caught the timeouts before the hosted run did.
 
-**Acceptance criteria:**
-- [ ] All 39 conversations run through the live `api.py` server via `local_evaluator.py`, uncached
-- [ ] Mean time per conversation recorded and under 60 s, with the slowest named
+- [ ] All 39 through the live server via `local_evaluator.py`, uncached
+- [ ] Mean time per conversation recorded, and the slowest named
 - [ ] Confirmation that no failure mode produces silence rather than a guess
-- [ ] Model weights confirmed present locally, so the attempt needs no network
+
+### 9: Azure sizing, if deploying
+
+**Blocked by:** None, but only matters if the endpoint moves off the Mac.
+
+The container is built and verified; sizing is not. Every timing is from an M4
+Pro. A CPU-only Azure VM will be slower and will reintroduce timeouts. See
+`docs/deploy.md` — a GPU VM keeps the models, and everything else is an
+environment variable.
+
+### 10: Merge
+
+**Blocked by:** A
+
+Open a PR from `fork/aljaz-medical` to the team repo, or get write access on
+`origin`. Note the fork is public.
+
+## Numbers worth not re-deriving
+
+Ceilings, measured with `tools/score.py --ceiling` / `--ceiling-words` (no LLM,
+returns in under a second):
+
+| Span granularity | mean tIoU |
+| --- | --- |
+| Whole ASR segments | 0.521 |
+| Whole sentences | 0.708 |
+| Runs of up to four sentences | 0.815 |
+| Best word run | 0.928 |
+| Best word run, calibrated offset | 0.938 |
+
+**1.00 is not reachable.** A perfect system on today's ASR word timings caps at
+about 0.963 final score. The gap is uniform quantization error, not a fixable
+bias — only finer timestamps (WhisperX forced alignment) would raise it, and
+that should be measured with `--ceiling-words` before any of it is built.
+Accuracy is worth +0.004 in total; do not spend time there.
+
+Timing, on an M4 Pro: ~33 s per conversation end to end, ~48 s worst case on the
+longest supplied audio, against a 60 s budget that is an **average across the
+whole attempt**.
+
+## Running it
+
+```
+./.venv/bin/python -m pytest              # 34 tests, no model needed
+./.venv/bin/python tools/score.py         # full score, ~12 min, buffers output
+./.venv/bin/python tools/score.py --limit 5
+./.venv/bin/python tools/replay.py        # frozen replies, seconds
+./.venv/bin/python tools/replay.py --diagnose
+caffeinate -dimsu ./.venv/bin/python api.py
+```
+
+Traps that have each cost real time:
+
+- Use `./.venv/bin/python`, never `python3` (3.14, wrong wheels).
+- Ollama is at **`127.0.0.1`**, never `localhost` — it binds IPv4 only and
+  `localhost` resolves to `::1` first, failing as a bare connection refused
+  while `curl` works.
+- Ollama defaults to a 4096-token context and silently truncates; `num_ctx` is
+  set explicitly in `ollama_client.py`.
+- Transcripts for all 39 are cached in `transcripts/` (gitignored). Do not
+  re-transcribe; it takes 13 minutes and the audio never changes.
+- **Span faults are invisible in accuracy.** A parsing bug once halved tIoU
+  while accuracy did not move at all. Judge every change by tIoU.
+- Batched inference gives no speedup on CPU and collapses segments; VAD does
+  nothing here. Both were measured and rejected.
+- The Mac is set to sleep after 1 minute. Run the server under `caffeinate`, or
+  the endpoint vanishes mid-attempt and silence ends it.
