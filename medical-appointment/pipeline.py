@@ -29,6 +29,13 @@ Transcriber = Callable[[bytes], List[Dict[str, Any]]]
 # and five in a row end the attempt.
 REQUEST_BUDGET_SECONDS = float(os.environ.get('REQUEST_BUDGET', '50'))
 
+# Of that, transcription may have this much. The rest is left for the ten
+# questions, which cost ~1.3 s each once the prompt prefix is warm. Without a
+# split, a long conversation spends the entire budget before a single question
+# is asked -- and no answering deadline can rescue a request that is already
+# over time when transcription returns.
+TRANSCRIBE_BUDGET_SECONDS = float(os.environ.get('TRANSCRIBE_BUDGET', '34'))
+
 
 def predict(
     request: ASRQuestionRequestDto,
@@ -52,7 +59,9 @@ def predict(
         )
 
         transcription_started = time.perf_counter()
-        segments = transcribe(audio_bytes)
+        segments = transcribe(
+            audio_bytes, deadline=started + TRANSCRIBE_BUDGET_SECONDS,
+        )
         transcription_seconds = time.perf_counter() - transcription_started
 
         answering_started = time.perf_counter()

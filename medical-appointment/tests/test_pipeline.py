@@ -26,7 +26,9 @@ def request(questions=QUESTIONS):
 
 
 def transcriber(segments):
-    return lambda audio_bytes: segments
+    # Accepts the deadline the pipeline passes; the real transcriber uses it to
+    # stop early rather than run the request past its budget.
+    return lambda audio_bytes, deadline=None: segments
 
 
 @pytest.fixture
@@ -95,7 +97,7 @@ class TestBudget:
 
         asked = []
 
-        def slow_transcribe(audio_bytes):
+        def slow_transcribe(audio_bytes, deadline=None):
             # Stands in for a long conversation eating the whole budget in ASR.
             pipeline.REQUEST_BUDGET_SECONDS = -1.0
             return segments
@@ -120,7 +122,7 @@ class TestNeverSilent:
     """Any reply beats none: five consecutive timeouts end the whole attempt."""
 
     def test_transcription_failure_still_returns_ten_answers(self):
-        def exploding(audio_bytes):
+        def exploding(audio_bytes, deadline=None):
             raise RuntimeError('ASR fell over')
 
         response = predict(request(), exploding, answerer_returning('no'))

@@ -17,7 +17,7 @@ import logging
 import os
 import tempfile
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -75,13 +75,24 @@ def _warm_up() -> None:
 _warm_up()
 
 
-def transcribe(audio_bytes: bytes) -> List[Dict[str, Any]]:
+def transcribe(
+    audio_bytes: bytes,
+    deadline: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     """Transcribe one conversation into numbered segments with word timings.
 
     Returns a list of ``{index, start, end, text, words}`` dicts, where each word
     is ``{start, end, word}``. The ``index`` is what the answering model names
     when it reports which segment it read an answer off, and it is the key the
     quote match is scoped to.
+
+    ``deadline`` is an absolute :func:`time.perf_counter` value. Transcription
+    is the larger half of the budget and grows with audio length, so on a long
+    conversation it can consume the whole 60 s on its own and score nothing.
+    faster-whisper yields segments lazily, so stopping early genuinely saves the
+    remaining work: we keep what was transcribed and answer from that. A partial
+    transcript loses the evidence at the end of the conversation; a timeout
+    loses all ten marks.
     """
     started = time.perf_counter()
 
@@ -95,7 +106,15 @@ def transcribe(audio_bytes: bytes) -> List[Dict[str, Any]]:
         )
 
         segments: List[Dict[str, Any]] = []
+        truncated = False
         for index, segment in enumerate(raw_segments):
+            if deadline is not None and time.perf_counter() > deadline:
+                truncated = True
+                logger.warning(
+                    'FALLBACK transcription stopped at %.1f s of audio: out of '
+                    'budget after %d segments', segment.start, index,
+                )
+                break
             segments.append({
                 'index': index,
                 'start': round(float(segment.start), 2),
@@ -114,7 +133,8 @@ def transcribe(audio_bytes: bytes) -> List[Dict[str, Any]]:
     elapsed = time.perf_counter() - started
     speech = segments[-1]['end'] if segments else 0.0
     logger.info(
-        'ASR: %d segments over %.1f s of speech in %.1f s (%.1fx realtime)',
+        'ASR: %d segments over %.1f s of speech in %.1f s (%.1fx realtime)%s',
         len(segments), speech, elapsed, speech / elapsed if elapsed else 0.0,
+        ' [TRUNCATED]' if truncated else '',
     )
     return segments

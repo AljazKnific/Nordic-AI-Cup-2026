@@ -26,8 +26,11 @@ COPY dtos.py utils.py api.py example.py pipeline.py answering.py asr.py \
 
 # Reach Ollama by service name rather than localhost: in Compose they are
 # separate containers. Overridable for a single-host or sidecar deployment.
+# The weights are baked in above, so never reach for the hub at startup: a
+# slow or absent network would otherwise delay or block the server coming up.
 ENV OLLAMA_HOST=http://ollama:11434 \
     OLLAMA_MODEL=qwen3:14b \
+    HF_HUB_OFFLINE=1 \
     PYTHONUNBUFFERED=1
 
 EXPOSE 9054
