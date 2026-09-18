@@ -118,13 +118,31 @@ _TOUCH_SECONDS = 0.05
 MAX_PASSAGE_SECONDS = 15.0
 
 # A model asked to quote what it read hands back the sentence it was reading and
-# often its neighbours, so among the sentences a span touches we prefer the ones
-# carrying the question's own terms, discounting candidates that run well past
-# the length of a typical passage. Measured over a broad plateau -- anything in
-# 0.1-0.35 against a 3-4 s target scores within 0.007 -- so these are not tuned
-# to an edge.
-TARGET_SECONDS = 3.5
+# often its neighbours, so among the sentences near a located span we prefer the
+# ones carrying the question's own terms, discounting candidates that run well
+# past the length of a typical passage.
+TARGET_SECONDS = 3.0
 LENGTH_PENALTY = 0.2
+
+# How far past the located span a passage may still reach, in seconds. An
+# annotated passage is the exchange, not the clause: it routinely opens with the
+# doctor's question and closes with the patient's answer, so it starts before,
+# and ends after, the words the model chose to quote. Considering only the
+# sentences the quote itself touches puts those passages out of reach entirely.
+# One second buys them back; beyond about 1.5 s the gain flattens and the risk
+# of reaching into the next exchange grows.
+REACH_SECONDS = 1.0
+
+# Weight on how much of the located span a candidate still covers. Reaching
+# outward needs a counterweight, or a neighbouring sentence with one question
+# word in it outscores the sentence the quote was actually read from. Small on
+# purpose: it breaks ties towards the quote rather than overruling the terms.
+ANCHOR_WEIGHT = 0.5
+
+# Passages run to at most a few sentences; four is well past the longest
+# annotated one, and capping the run stops a candidate growing to cover a whole
+# exchange plus its neighbours.
+MAX_RUN_SENTENCES = 4
 
 # Too common to say anything about which sentence answers a question. Kept small
 # and generic on purpose: a medical lexicon here would be fitted to the 39
@@ -191,24 +209,39 @@ def to_passage(
     whole number of sentences. Returns the span untouched when it lies in no
     sentence at all, or when the sentences it lies in are too long to be real --
     both of which mean the ASR emitted no usable punctuation here.
+
+    Candidates are runs of neighbouring sentences, taken from a window that
+    reaches ``REACH_SECONDS`` past the located span at either end, and scored on
+    the question's own terms against how much of the located span they keep.
+    Reaching outward is what lets a passage that opens with the doctor's
+    question and closes with the patient's answer be returned whole, when the
+    model quoted only one half of it.
     """
+    window = (span[0] - REACH_SECONDS, span[1] + REACH_SECONDS)
+    near = [s for s in sentences if _overlap(window, s) > _TOUCH_SECONDS]
     touched = [s for s in sentences if _overlap(span, s) > _TOUCH_SECONDS]
     if not touched:
         return span
 
     whole = (touched[0].start, touched[-1].end)
     asked = _content_words(question) if question else set()
-    if not asked or len(touched) < 2:
+    if not asked or len(near) < 2:
         return _plausible(whole, span)
 
+    located = max(span[1] - span[0], 0.1)
     best: Optional[Tuple[float, Span]] = None
-    for first in range(len(touched)):
-        for last in range(first, len(touched)):
-            candidate = (touched[first].start, touched[last].end)
+    for first in range(len(near)):
+        for last in range(first, min(first + MAX_RUN_SENTENCES, len(near))):
+            candidate = (near[first].start, near[last].end)
+            if candidate[1] - candidate[0] > MAX_PASSAGE_SECONDS:
+                continue
             shared = len(asked & _content_words(
-                ' '.join(s.text for s in touched[first:last + 1])))
-            score = shared - LENGTH_PENALTY * max(
-                0.0, (candidate[1] - candidate[0]) - TARGET_SECONDS)
+                ' '.join(s.text for s in near[first:last + 1])))
+            kept = max(0.0, min(span[1], candidate[1])
+                       - max(span[0], candidate[0])) / located
+            score = (shared + ANCHOR_WEIGHT * kept
+                     - LENGTH_PENALTY * max(
+                         0.0, (candidate[1] - candidate[0]) - TARGET_SECONDS))
             if best is None or score > best[0] + 1e-9:
                 best = (score, candidate)
     return _plausible(best[1] if best else whole, span)

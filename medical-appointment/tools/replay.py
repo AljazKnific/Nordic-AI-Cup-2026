@@ -50,10 +50,17 @@ def best_sentence_run(sentences, gold: Span) -> float:
 
 
 def sentences_in(sentences, segment) -> list:
-    """The sentences the named segment reaches -- what its choice made available."""
+    """The sentences the named segment reaches -- what its choice made available.
+
+    Padded by the reach the span logic itself allows, so this stays the same
+    question the span logic is asked: naming a segment makes the sentences just
+    past it reachable too.
+    """
+    reach = answering.REACH_SECONDS
     return [
         s for s in sentences
-        if min(float(segment['end']), s.end) - max(float(segment['start']), s.start) > 0.05
+        if min(float(segment['end']) + reach, s.end)
+        - max(float(segment['start']) - reach, s.start) > 0.05
     ]
 
 

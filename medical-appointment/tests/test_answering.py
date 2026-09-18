@@ -271,6 +271,29 @@ class TestPassages:
         assert span[1] - span[0] < 6.0
         assert span[0] >= punctuated[2]['words'][1]['start']
 
+    def test_a_passage_reaches_past_the_quote_to_the_question_it_answers(self, punctuated):
+        """An annotated passage is the exchange, not the half the model quoted.
+
+        The quote lies wholly inside the closing sentence; the question's own
+        terms are in the sentence before it, within the reach the span logic
+        allows, so the passage returned covers both.
+        """
+        answerer = replies(reply('yes', 2, 'Take it after a meal.'))
+        [(_, span)] = answer_conversation(
+            punctuated, ['Is the two week course taken after a meal?'], answerer)
+
+        # 'One hundred milligrams daily for two weeks.' precedes the quote.
+        dose_sentence = punctuated[2]['words'][1]['start']
+        assert span[0] <= dose_sentence
+        assert span[1] == 14.0
+
+    def test_reaching_outward_does_not_overrule_the_sentence_quoted(self, punctuated):
+        """The reach breaks ties towards neighbours, it does not abandon the quote."""
+        answerer = replies(reply('yes', 0, 'Good morning'))
+        [(_, span)] = answer_conversation(punctuated, ['Did the doctor say good morning?'], answerer)
+
+        assert span[0] == 0.0
+
     def test_the_quote_is_still_matched_only_inside_the_named_segment(self, punctuated):
         """Widening must not reintroduce conversation-wide matching."""
         answerer = replies(reply('yes', 0, 'after a meal'))
