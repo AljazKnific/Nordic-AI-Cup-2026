@@ -7,6 +7,7 @@ These assert the shape of the body, not the quality of the answers.
 
 import base64
 import json
+import time
 
 import pytest
 
@@ -145,3 +146,64 @@ class TestNeverSilent:
         response = predict(request(), transcriber([]), answerer_returning('no'))
 
         validate_response(response, expected_count=10)
+
+
+class TestTheBudgetCoversTransport:
+    """The evaluator's clock starts when it sends, so ours must too.
+
+    A conversation answered in 35 s by a clock that started after the body was
+    parsed was still scored as a timeout at 60 s: the upload was not free and
+    was not being counted. These pin the arrival clock reaching the deadlines.
+    """
+
+    def test_time_before_arrival_is_spent_out_of_the_budget(self, segments):
+        import pipeline
+
+        deadlines = []
+
+        def recording_answerer(prompt, timeout=None):
+            deadlines.append(timeout)
+            return 'no'
+
+        late = time.perf_counter() - pipeline.REQUEST_BUDGET_SECONDS + 5.0
+        predict(request(), transcriber(segments), recording_answerer, arrived=late)
+
+        # Only ~5 s of the budget survives the upload, and the answerer is told.
+        assert deadlines and deadlines[0] is not None
+        assert deadlines[0] <= 5.0
+
+    def test_a_request_that_arrived_too_long_ago_guesses_rather_than_stalls(self, segments):
+        import pipeline
+
+        asked = []
+
+        def answerer(prompt, timeout=None):
+            asked.append(prompt)
+            return 'no'
+
+        stale = time.perf_counter() - pipeline.REQUEST_BUDGET_SECONDS - 1.0
+        response = predict(request(), transcriber(segments), answerer, arrived=stale)
+
+        assert asked == []
+        validate_response(response, expected_count=10)
+
+    def test_transcription_yields_time_to_the_questions_still_to_come(self):
+        import pipeline
+
+        now = time.perf_counter()
+        ten = pipeline._transcribe_deadline(now, 10) - now
+        one = pipeline._transcribe_deadline(now, 1) - now
+
+        # Ten questions reserve more than one does, and neither starves the ASR.
+        assert one > ten
+        assert ten >= pipeline.MIN_TRANSCRIBE_SECONDS
+        assert ten <= pipeline.REQUEST_BUDGET_SECONDS
+
+    def test_a_slow_upload_never_leaves_transcription_with_no_time(self):
+        """An empty transcript scores nothing; a partial one scores something."""
+        import pipeline
+
+        arrived_long_ago = time.perf_counter() - pipeline.REQUEST_BUDGET_SECONDS
+        allowed = pipeline._transcribe_deadline(arrived_long_ago, 10) - time.perf_counter()
+
+        assert allowed >= pipeline.MIN_TRANSCRIBE_SECONDS - 0.1

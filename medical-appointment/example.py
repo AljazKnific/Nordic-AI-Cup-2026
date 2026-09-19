@@ -11,6 +11,7 @@ period in the attempt and the first inference is the slowest one.
 """
 
 import logging
+from typing import Optional
 
 import ollama_client
 from asr import transcribe
@@ -26,6 +27,16 @@ ollama_client.warm_up()
 
 ### CALL YOUR CUSTOM MODEL VIA THIS FUNCTION ###
 
-def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
-    """Answer every question about one conversation."""
-    return run_pipeline(request, transcribe=transcribe, answerer=ollama_client.answer)
+def predict(
+    request: ASRQuestionRequestDto, arrived: Optional[float] = None,
+) -> ASRQuestionResponseDto:
+    """Answer every question about one conversation.
+
+    ``arrived`` comes from :mod:`api`, and is when the request landed rather
+    than when its body finished parsing. Uploading a conversation is a real
+    part of the evaluator's 60 s and has to be a real part of ours.
+    """
+    return run_pipeline(
+        request, transcribe=transcribe, answerer=ollama_client.answer,
+        arrived=arrived,
+    )

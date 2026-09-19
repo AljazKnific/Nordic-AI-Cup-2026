@@ -27,10 +27,12 @@ TIMEOUT_SECONDS = float(os.environ.get('OLLAMA_TIMEOUT', '30'))
 # ~26 tok/s, so an unbounded reply is a budget risk, not just a slow one.
 MAX_TOKENS = 160
 
-# Never wait less than this, even when the budget says so. A sub-second timeout
-# cannot produce an answer and only turns a slow call into a failed one; the
-# caller's deadline check is what decides whether to ask at all.
-MIN_TIMEOUT_SECONDS = 1.0
+# Below this much remaining budget there is no point asking: a 14B model needs
+# well over a second to answer, so the call would fail *and* spend what was
+# left doing it. The caller treats a refusal here the same as any other failed
+# answer -- it guesses -- which is what it would have done anyway, a second
+# sooner. Measured at ~1.2-2.2 s per answer once the prefix is warm.
+MIN_TIMEOUT_SECONDS = 3.0
 
 # Ollama defaults to a 4096-token context and silently truncates past it -- and
 # a question answered from a truncated transcript looks like a model failure
@@ -55,12 +57,21 @@ def answer(prompt: str, timeout: Optional[float] = None) -> str:
     only *between* calls: the check passes at 49 s and the call returns at 79 s.
     Capped by ``TIMEOUT_SECONDS`` either way -- no single call is worth longer
     than that even when the budget would allow it.
+
+    Raises :class:`TimeoutError` without calling when less than
+    :data:`MIN_TIMEOUT_SECONDS` remains.
     """
     started = time.perf_counter()
     if timeout is None:
         timeout = TIMEOUT_SECONDS
+    elif timeout < MIN_TIMEOUT_SECONDS:
+        # Clamping *up* here was a real bug: it sent a doomed 1 s request that
+        # failed and burned the last of the budget. Refuse instead.
+        raise TimeoutError(
+            f'{timeout:.1f} s left, under the {MIN_TIMEOUT_SECONDS:.0f} s an '
+            f'answer needs; not asking')
     else:
-        timeout = max(MIN_TIMEOUT_SECONDS, min(timeout, TIMEOUT_SECONDS))
+        timeout = min(timeout, TIMEOUT_SECONDS)
     response = requests.post(
         f'{HOST}/api/generate',
         json={

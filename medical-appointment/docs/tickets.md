@@ -64,6 +64,49 @@ for this account. Local `main` is stale at 0.692.
 | 12 | Extent constants fitted under leave-one-out CV. 0.759 -> 0.767 |
 | 13 | Abbreviation guard in `sentences_of`; per-call LLM timeout bounded by the budget |
 
+## The 0.61 run, and what it taught (2026-09-19)
+
+A hosted attempt after the fitting work scored **0.61**, down from 0.69, with two
+conversations reported as `timed out after 60 seconds. All 10 questions were
+scored wrong.` Two lost conversations is 20 of ~200 marks, which is the whole
+drop — the modelling changes were not the cause.
+
+**The server did not fail either request.** It logged 19 POSTs and 19 `200 OK`,
+worst case 50.1 s. Of the two the evaluator failed:
+
+- `conversation_sample_3.mp3` was answered in **35.0 s by our clock** and still
+  timed out at the evaluator's 60 s. **25 s was spent somewhere this process
+  could not see.**
+- `conversation_sample_46.mp3` never appears in the log at all. Its body was
+  never read.
+
+**The cause: we were budgeting the wrong 50 seconds.** `predict` started its
+clock after FastAPI had already received and parsed the request body. A
+conversation is a 3-4 MB MP3, about 5 MB base64'd, and uploading it is a real
+part of the evaluator's 60 s. It was not part of ours.
+
+Fixed by stamping arrival in an HTTP middleware (`api.py`), before the body is
+read, and budgeting from that. `TIMING` now opens with `arrival-to-work`, and
+every request logs `REQUEST served in N s wall`. On loopback both read 0.0 s and
+identical totals; **on the hosted path that field is the measurement that was
+missing**, so read it first after the next attempt.
+
+Two smaller faults found in the same log:
+
+- **`MIN_TIMEOUT_SECONDS` clamped the remaining budget upward**, so with under a
+  second left we sent a doomed 1 s request to Ollama that failed *and* spent what
+  remained. It now refuses below 3 s and guesses instead. Cost: one question.
+- **`logging.basicConfig` ran after `from example import predict`**, which loads
+  and exercises both models, so every warm-up timing was silently discarded.
+  Moved above the imports; timestamps added.
+
+And one design fault that had been costing marks since before this run: a fixed
+`TRANSCRIBE_BUDGET=34` against `REQUEST_BUDGET=50` was never consistent with ten
+questions at 2.0-2.5 s each (34 + 25 = 59 > 50), which is why the earlier hosted
+run guessed its last few questions on every long conversation. The transcription
+deadline is now derived from what the remaining questions will cost, with a floor
+on *work seconds* so a slow upload can never leave transcription with nothing.
+
 ## Declined, with the evidence
 
 **Ticket 6 — matching question terms against garbled transcript words.** All four

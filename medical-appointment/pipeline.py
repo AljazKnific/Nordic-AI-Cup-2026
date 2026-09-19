@@ -27,23 +27,61 @@ Transcriber = Callable[[bytes], List[Dict[str, Any]]]
 # with audio length, so on a long conversation or a slow host there may be very
 # little left. A guessed answer is worth half a mark; a timeout is worth nothing
 # and five in a row end the attempt.
+#
+# **This budget is measured from when the request arrived, not from when we
+# started work on it.** A conversation is a 3-4 MB MP3, ~5 MB once base64'd,
+# and uploading it is not free: on 2026-09-19 `conversation_sample_3.mp3` was
+# answered in 35.0 s by this clock and still timed out at the evaluator's 60 s,
+# so 25 s went somewhere this process could not see. Anything measured from
+# inside `predict` is measuring the wrong 50 seconds.
 REQUEST_BUDGET_SECONDS = float(os.environ.get('REQUEST_BUDGET', '50'))
 
-# Of that, transcription may have this much. The rest is left for the ten
-# questions, which cost ~1.3 s each once the prompt prefix is warm. Without a
-# split, a long conversation spends the entire budget before a single question
-# is asked -- and no answering deadline can rescue a request that is already
-# over time when transcription returns.
-TRANSCRIBE_BUDGET_SECONDS = float(os.environ.get('TRANSCRIBE_BUDGET', '34'))
+# What one answer costs once the prompt prefix is warm: 1.2-1.5 s on an M4 Pro,
+# 2.0-2.5 s on the hosted machine. The transcription deadline is derived from
+# it rather than fixed, so transcription yields exactly when the questions still
+# to come need the time. A fixed 34 s was never consistent with the rest of the
+# budget -- 34 + 10 x 2.5 is 59 s against a 50 s allowance, which is precisely
+# how the hosted run came to guess its last few questions.
+SECONDS_PER_QUESTION = float(os.environ.get('SECONDS_PER_QUESTION', '2.5'))
+
+# Seconds of *actual transcription work*, never less, whatever the budget says.
+# This is a floor on work rather than a point on the clock on purpose: a slow
+# upload can arrive with most of the 60 s already gone, and subtracting the
+# questions' share from what is left would hand transcription zero seconds and
+# return an empty transcript. Ten questions answered against no transcript at
+# all score nothing; answered against the first fifteen seconds of the
+# conversation they score something. Always come back with a transcript.
+MIN_TRANSCRIBE_SECONDS = float(os.environ.get('MIN_TRANSCRIBE', '12'))
+
+
+def _transcribe_deadline(started: float, questions: int) -> float:
+    """When transcription must stop, so the questions still have time to run.
+
+    Measured from now, not from arrival: by the time this is called the upload
+    has already been paid for, and what matters is how much of the budget is
+    still unspent.
+    """
+    now = time.perf_counter()
+    remaining = REQUEST_BUDGET_SECONDS - (now - started)
+    allowed = remaining - questions * SECONDS_PER_QUESTION
+    return now + max(MIN_TRANSCRIBE_SECONDS, allowed)
 
 
 def predict(
     request: ASRQuestionRequestDto,
     transcribe: Transcriber,
     answerer: Answerer,
+    arrived: Optional[float] = None,
 ) -> ASRQuestionResponseDto:
-    """Answer every question about one conversation."""
-    started = time.perf_counter()
+    """Answer every question about one conversation.
+
+    ``arrived`` is a :func:`time.perf_counter` reading from when the request
+    landed, before its body was read. Every budget here runs from it, so upload
+    time is spent out of the same 60 s the evaluator is counting. Without it the
+    clock starts once the body is already parsed, which is how a conversation
+    answered in 35 s can still be scored as a timeout.
+    """
+    started = arrived if arrived is not None else time.perf_counter()
     questions: Sequence[str] = request.questions
     duration: Optional[float] = None
 
@@ -59,9 +97,8 @@ def predict(
         )
 
         transcription_started = time.perf_counter()
-        segments = transcribe(
-            audio_bytes, deadline=started + TRANSCRIBE_BUDGET_SECONDS,
-        )
+        segments = transcribe(audio_bytes, deadline=_transcribe_deadline(
+            started, len(questions)))
         transcription_seconds = time.perf_counter() - transcription_started
 
         answering_started = time.perf_counter()
@@ -90,8 +127,10 @@ def predict(
 
     total = time.perf_counter() - started
     logger.info(
-        'TIMING %s: transcribe %.1f s, answer %.1f s (%.1f s/question), total %.1f s',
+        'TIMING %s: arrival-to-work %.1f s, transcribe %.1f s, answer %.1f s '
+        '(%.1f s/question), total %.1f s',
         request.audio_filename,
+        transcription_started - started,
         transcription_seconds,
         answering_seconds,
         answering_seconds / len(questions) if questions else 0.0,
