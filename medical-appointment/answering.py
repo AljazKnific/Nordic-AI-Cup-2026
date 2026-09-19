@@ -154,6 +154,11 @@ LENGTH_PENALTY = 0.2
 #
 # 1.25 rather than 1.0 because that is what fitting chose: see `tools/fit.py`,
 # where all 39 leave-one-conversation-out folds picked it independently.
+# Symmetric, and measured twice. Splitting it into a backward and a forward
+# reach loses under nested CV (-0.0083, CI -0.0215 to +0.0000), and 37 of the 39
+# folds chose the two halves equal anyway -- in both directions: reaching
+# *further* forward was rejected earlier, and reaching *less* forward was
+# rejected on 2026-09-19. See `docs/tickets.md`.
 REACH_SECONDS = 1.25
 
 # Weight on how much of the located span a candidate still covers. Reaching

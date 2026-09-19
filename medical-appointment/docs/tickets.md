@@ -176,6 +176,27 @@ would manufacture run-ons, which cost far more than the split they prevent.
 Unit abbreviations (`mg.`, `ml.`) appear **zero** times; adding them would be
 speculation dressed as a fix.
 
+**Reaching less far forward than back.** `tools/disagreements.py` shows the
+error is lopsided by *count*: our span ends late 113 times against 35 early, and
+runs long 118 times against 48 short. That looks like a reach that is too
+generous forward — and it is the opposite of the asymmetric reach rejected
+earlier, which reached *further* forward, so it was worth its own test.
+
+It lost: **-0.0083 under nested CV, CI -0.0215 to +0.0000**, and 37 of 39 folds
+chose the two halves *equal* anyway. Two lessons, both worth keeping:
+
+- **Count lopsidedness is not effect size.** The median end error is **+0.08 s**.
+  Most of those 113 late endings are late by nothing at all; the cost is in the
+  p90 of +2.10 s, a tail that a constant reach cannot address.
+- **An extra parameter has a price.** Splitting one constant into two made the
+  nested-CV result *worse*, not merely flat. Six parameters already sit close to
+  what 195 passages can support.
+
+Reverted rather than kept at zero, unlike `PAD_SECONDS`: `REACH_BACK = REACH`
+binds once at import, so a fitter setting `REACH_SECONDS` would silently leave
+the halves stale. A dead parameter that can quietly report the wrong number is
+worse than no parameter.
+
 **Matching a quote across all segments when the named index looks off by one.**
 This deletes the segment-scoped match, which `answering.py` documents as
 load-bearing: it is the only thing stopping a phrase repeated later in the
