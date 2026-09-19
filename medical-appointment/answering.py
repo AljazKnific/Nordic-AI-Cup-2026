@@ -144,13 +144,18 @@ MAX_PASSAGE_SECONDS = 15.0
 TARGET_SECONDS = 3.0
 LENGTH_PENALTY = 0.2
 
-# How far past the located span a passage may still reach, in seconds. An
-# annotated passage is the exchange, not the clause: it routinely opens with the
-# doctor's question and closes with the patient's answer, so it starts before,
-# and ends after, the words the model chose to quote. Considering only the
-# sentences the quote itself touches puts those passages out of reach entirely.
-# One second buys them back; beyond about 1.5 s the gain flattens and the risk
-# of reaching into the next exchange grows.
+# How far past the located span a passage may still reach, in seconds.
+#
+# The reason first given for this was wrong, and measuring it is what found the
+# error: an annotated passage is *not* usually "the exchange, doctor's question
+# through patient's answer". **72% of gold passages are exactly one sentence**,
+# 19% are two, and only 2% of the one-sentence ones open with a question. The
+# reach is not buying back exchanges, because there are hardly any.
+#
+# What it does buy is tolerance: the quote the model returns rarely lines up
+# with a sentence boundary, so a window that reaches a little past it keeps the
+# right sentence in the candidate set. That is why the value survived fitting
+# (all 39 folds chose 1.25) while the theory behind it did not.
 #
 # 1.25 rather than 1.0 because that is what fitting chose: see `tools/fit.py`,
 # where all 39 leave-one-conversation-out folds picked it independently.
@@ -189,12 +194,16 @@ MAX_RUN_SENTENCES = 2
 # is worth +0.002 with a bootstrap interval straddling zero; splitting this into
 # two parameters would be re-buying that result with a new name.
 #
-# **Measured and worth nothing.** Fitting chose 0.0 in all 39 folds, so the
-# sentence bounds we already return are not systematically narrow after all.
-# Kept at zero, and kept as a search dimension in `tools/fit.py`, so the
-# negative result stays reproducible rather than becoming folklore. Do not
-# reintroduce a pad without new evidence.
-PAD_SECONDS = 0.0
+# **Negative: the passage is inset, not widened.** The first fit of this chose
+# 0.0, but only because the grid ran from zero upwards -- widening was on it and
+# shrinking was not. With negatives on the grid all 39 leave-one-out folds chose
+# -0.05, worth +0.0023 mean tIoU with a CI of +0.0004 to +0.0044.
+#
+# Small, and that is the finding rather than a disappointment: where we cover
+# the gold passage and overshoot, the sentence is a median 0.38 s too wide, but
+# an inset big enough to matter cuts into the passage. -0.10 is already worse
+# than nothing and -0.30 costs 0.06. The overshoot is not a margin to be shaved.
+PAD_SECONDS = -0.05
 
 # Too common to say anything about which sentence answers a question. Kept small
 # and generic on purpose: a medical lexicon here would be fitted to the 39
@@ -211,6 +220,10 @@ class Sentence(NamedTuple):
     start: float
     end: float
     text: str
+    # Kept so a passage can be trimmed inside the sentence it lands in. The
+    # word timings are already paid for by the ASR and already good enough to
+    # place a passage at 0.929 mean tIoU; nothing here needs finer ones.
+    words: tuple = ()
 
 
 def _content_words(text: str) -> set:
@@ -253,7 +266,49 @@ def _sentence(words: Sequence[Dict[str, Any]]) -> Sentence:
         float(words[0]['start']),
         float(words[-1]['end']),
         ' '.join(str(word.get('word', '')) for word in words),
+        tuple((float(w['start']), float(w['end']), str(w.get('word', '')))
+              for w in words),
     )
+
+
+# Words a sentence opens with that the annotation does not include. A gold
+# passage starts a median of 0.14 s after the sentence carrying it, and where we
+# cover gold and overshoot, the sentence is a median 0.38 s too wide -- about
+# what one of these costs. Openers only: the same word mid-sentence is ordinary
+# speech, and trailing filler is rarer here than leading.
+_OPENERS = frozenset("""
+so ok okay right well now um uh erm ah oh yeah yes no and but then alright
+""".split())
+
+# **Measured, and it loses.** -0.0056 mean tIoU with the interval entirely
+# below zero, and all 39 folds chose it off. The reasoning was sound -- a gold
+# passage starts a median 0.14 s after its sentence, about what "So," costs --
+# but the annotation evidently keeps those openers more often than it drops
+# them. Left in place and on the fit grid so the result can be re-checked in
+# seconds instead of rebuilt; do not turn it on without new evidence.
+TRIM_OPENERS = 0
+
+
+def _trim_openers(passage: Span, sentences: Sequence[Sentence]) -> Span:
+    """Drop discourse openers from the front of the sentence a passage starts in.
+
+    Only ever moves the start forward, never past the sentence's own last word,
+    and only when the passage genuinely begins at a sentence boundary -- a span
+    that already starts mid-sentence has nothing to trim.
+    """
+    if not TRIM_OPENERS:
+        return passage
+    for sentence in sentences:
+        if abs(sentence.start - passage[0]) > 0.05 or not sentence.words:
+            continue
+        for start, _end, word in sentence.words[:-1]:
+            if _normalise(word) in _OPENERS:
+                continue
+            if start <= passage[0] + 0.01 or start >= passage[1]:
+                return passage
+            return (start, passage[1])
+        return passage
+    return passage
 
 
 def _overlap(span: Span, sentence: Sentence) -> float:
@@ -281,12 +336,12 @@ def to_passage(
     near = [s for s in sentences if _overlap(window, s) > _TOUCH_SECONDS]
     touched = [s for s in sentences if _overlap(span, s) > _TOUCH_SECONDS]
     if not touched:
-        return _padded(span)
+        return _finish(span, sentences)
 
     whole = (touched[0].start, touched[-1].end)
     asked = _content_words(question) if question else set()
     if not asked or len(near) < 2:
-        return _plausible(whole, span)
+        return _plausible(whole, span, sentences)
 
     located = max(span[1] - span[0], 0.1)
     best: Optional[Tuple[float, Span]] = None
@@ -304,23 +359,37 @@ def to_passage(
                          0.0, (candidate[1] - candidate[0]) - TARGET_SECONDS))
             if best is None or score > best[0] + 1e-9:
                 best = (score, candidate)
-    return _plausible(best[1] if best else whole, span)
+    return _plausible(best[1] if best else whole, span, sentences)
 
 
-def _plausible(passage: Span, span: Span) -> Span:
+def _plausible(passage: Span, span: Span,
+               sentences: Sequence[Sentence] = ()) -> Span:
     """The rounded-out passage, unless it is too long to be one."""
     if passage[1] - passage[0] > MAX_PASSAGE_SECONDS:
         logger.info('FALLBACK sentence longer than %.0f s; keeping the located span',
                     MAX_PASSAGE_SECONDS)
-        return _padded(span)
-    return _padded(passage)
+        return _finish(span, sentences)
+    return _finish(passage, sentences)
 
 
 def _padded(passage: Span) -> Span:
-    """The passage widened by the constant offset, never before the recording."""
+    """The passage widened by the constant offset -- or narrowed, if negative.
+
+    A negative pad insets both edges, which is the direction the data actually
+    asks for: where we cover the gold passage and overshoot, the sentence we
+    return is a median 0.38 s wider than it. Never inset past the midpoint.
+    """
     if not PAD_SECONDS:
         return passage
-    return (max(0.0, passage[0] - PAD_SECONDS), passage[1] + PAD_SECONDS)
+    start, end = passage[0] - PAD_SECONDS, passage[1] + PAD_SECONDS
+    if start >= end:
+        return passage
+    return (max(0.0, start), end)
+
+
+def _finish(passage: Span, sentences: Sequence[Sentence]) -> Span:
+    """Everything applied to a passage after its sentences have been chosen."""
+    return _padded(_trim_openers(passage, sentences))
 
 
 def resolve_span(

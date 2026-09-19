@@ -10,6 +10,19 @@ import json
 
 import pytest
 
+import answering
+
+
+def inset_of(bounds):
+    """Bounds as they come back once the constant inset has been applied.
+
+    Every returned passage is moved in by ``PAD_SECONDS`` at each edge. Tests
+    that pin exact bounds are asserting *which* sentence was chosen, so they
+    say so through here rather than hard-coding the offset in each one.
+    """
+    inset = answering.PAD_SECONDS
+    return (round(max(0.0, bounds[0] - inset), 2), round(bounds[1] + inset, 2))
+
 from answering import answer_conversation, build_transcript_header
 
 
@@ -97,7 +110,7 @@ class TestSpans:
         [(answer, span)] = answer_conversation(segments, ['Is the dose 100 mg?'], answerer)
 
         assert answer is True
-        assert span == (20.0, 26.0)
+        assert span == inset_of((20.0, 26.0))
 
     def test_quote_is_matched_only_inside_the_named_segment(self, segments):
         """The duplicate-mention guarantee: 'the' appears in several segments."""
@@ -272,7 +285,7 @@ class TestPassages:
 
         # 'Take it after a meal.' starts before the quoted words do.
         sentence_start = punctuated[2]['words'][-5]['start']
-        assert span == (sentence_start, 14.0)
+        assert span == inset_of((sentence_start, 14.0))
 
     def test_a_sentence_split_across_two_segments_is_returned_whole(self, punctuated):
         """The point of the change: the segment boundary must not truncate it."""
@@ -306,16 +319,21 @@ class TestPassages:
             punctuated, ['Is the two week course taken after a meal?'], answerer)
 
         # 'One hundred milligrams daily for two weeks.' precedes the quote.
+        # Both edges sit within the constant inset of the sentence bounds: what
+        # is asserted here is which sentences the passage covers, not the exact
+        # floats, and the inset moves each edge by |PAD_SECONDS|.
+        inset = abs(answering.PAD_SECONDS)
         dose_sentence = punctuated[2]['words'][1]['start']
-        assert span[0] <= dose_sentence
-        assert span[1] == 14.0
+        assert span[0] <= dose_sentence + inset
+        assert span[1] == pytest.approx(14.0 - inset, abs=0.01)
 
     def test_reaching_outward_does_not_overrule_the_sentence_quoted(self, punctuated):
         """The reach breaks ties towards neighbours, it does not abandon the quote."""
         answerer = replies(reply('yes', 0, 'Good morning'))
         [(_, span)] = answer_conversation(punctuated, ['Did the doctor say good morning?'], answerer)
 
-        assert span[0] == 0.0
+        # The opening sentence, give or take the constant inset.
+        assert span[0] <= abs(answering.PAD_SECONDS) + 0.01
 
     def test_the_quote_is_still_matched_only_inside_the_named_segment(self, punctuated):
         """Widening must not reintroduce conversation-wide matching."""

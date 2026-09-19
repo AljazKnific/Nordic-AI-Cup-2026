@@ -5,8 +5,8 @@ Written for a session that has no memory of how any of this came about. Read
 
 ## Where things stand
 
-**Local score 0.767** over the 39 supplied conversations — accuracy 0.990, mean
-tIoU 0.618. The floor is 0.200. `Score = 0.4 x Accuracy + 0.6 x mean tIoU`, so
+**Local score 0.768** over the 39 supplied conversations — accuracy 0.990, mean
+tIoU 0.621. The floor is 0.200. `Score = 0.4 x Accuracy + 0.6 x mean tIoU`, so
 evidence is the larger half and is where all remaining points are.
 
 **Read that number carefully: 0.767 is from replayed replies, not a live run.**
@@ -63,6 +63,43 @@ for this account. Local `main` is stale at 0.692.
 | 7 | Mention selection: sentence choice shipped (0.745 -> 0.759); segment choice **declined with evidence** — see below |
 | 12 | Extent constants fitted under leave-one-out CV. 0.759 -> 0.767 |
 | 13 | Abbreviation guard in `sentences_of`; per-call LLM timeout bounded by the budget |
+
+## Where the remaining loss actually is (2026-09-19)
+
+Measured with `tools/disagreements.py`. Of 0.382 of tIoU lost:
+
+| | n | loss | share |
+| --- | --- | --- | --- |
+| gold fully covered, we returned extra | 104 | 0.152 | 40% |
+| partly missed *and* extra returned | 68 | 0.181 | 48% |
+| returned too little / misplaced | 19 | 0.028 | 7% |
+| answered no | 4 | 0.021 | 5% |
+
+**Returning more than the passage is involved in 88% of the loss.** But it is
+mostly not fixable by returning fewer sentences: of the 104 clean
+over-inclusions, **82% already return exactly the sentences gold occupies** and
+overshoot by a median 0.38 s *inside* them. Only 18% take two sentences where
+one would do.
+
+Two structural facts that close off several plausible-sounding ideas:
+
+**Gold passages are single sentences, not exchanges.** 72% span exactly one
+sentence, 19% two. Only 2% of the one-sentence ones open with a question. The
+comment in `answering.py` that justified `REACH_SECONDS` as buying back
+"doctor's question through patient's answer" exchanges was **wrong**, and is
+corrected. The parameter survived fitting; the theory did not.
+
+**So speaker diarisation would make this worse, not better.** A speaker turn is
+coarser than a sentence, and gold is one sentence 72% of the time. Tested the
+cheap proxy too — "is the previous sentence a question?" as a stand-in for a
+speaker change, on the 1-vs-2 decision — and it splits 24% against 32%, which is
+not a signal.
+
+**Transcription is not the constraint either.** The word timings we already have
+support a ceiling of **0.929** mean tIoU (`tools/score.py --ceiling-words`)
+against the 0.621 we return. Better ASR, forced alignment and diarisation all
+raise a ceiling that is already 0.31 above where we stand. The gap is in
+*choosing* sub-sentence bounds from timings we hold, not in getting better ones.
 
 ## The 0.61 run, and what it taught (2026-09-19)
 
@@ -141,18 +178,33 @@ same theory — was also measured and is worth +0.002 tIoU with a bootstrap inte
 straddling zero. Not shipped.
 
 **Within-sentence trimming — stripping "So," / "Okay," off a passage edge.**
-Proposed as cheap evidence headroom; the data says it pushes the wrong way. Gold
-passages are already close to sentence-aligned — 68.7% of gold starts fall within
+**Built and measured on 2026-09-19: -0.0056 mean tIoU, interval entirely below
+zero, and all 39 folds chose it off.** The switch is `TRIM_OPENERS` and it is
+still on the fit grid, so this can be re-checked in seconds rather than rebuilt.
+
+The reasoning was sound and the annotation simply does not agree with it: a gold
+passage starts a median 0.14 s after the sentence carrying it, about what "So,"
+costs, but the annotators evidently keep those openers more often than they drop
+them. The earlier aggregate argument for declining it also holds. Gold passages
+are already close to sentence-aligned — 68.7% of gold starts fall within
 0.25 s of a sentence start, 81% of ends within 0.25 s of a sentence end — and the
 sentence run covering a gold passage exceeds it by a **median of 0.20 s**. A
 leading discourse marker is 0.3-0.5 s, so trimming one cuts into gold more often
 than it tightens onto it. Worse, in **15.9%** of cases gold is *longer* than the
 sentences we point at: we under-reach there, and trimming widens the miss.
 
-**A constant symmetric pad on the finished passage.** Built as a sixth fitted
-parameter (`PAD_SECONDS`) precisely to buy back that 15.9%. Fitting chose **0.0
-in all 39 folds**. The parameter is kept at zero and kept in `tools/fit.py`'s
-search so the negative stays reproducible. Do not reintroduce it by hand.
+**A constant pad that *widens* the finished passage.** Built as a sixth fitted
+parameter to buy back the 15.9% of gold passages that run longer than our
+sentences. Fitting chose 0.0 in all 39 folds — but only because the grid ran
+from zero upwards. **Widening was on the grid and shrinking was not**, which is
+a lesson about search design rather than about padding: a one-sided grid can
+only ever return the boundary.
+
+With negatives added, all 39 folds chose **-0.05**, an inset, worth **+0.0023
+mean tIoU, CI +0.0004 to +0.0044**. Shipped. It is a small number and that is
+the finding: an inset large enough to matter cuts into the passage. -0.10 is
+already worse than nothing and -0.30 costs 0.06. **The overshoot is not a margin
+to be shaved.**
 
 **Structured JSON output (Ollama `format`) and regex parser fallbacks.** Both
 target malformed replies. Across every log ever captured — `diagnostics/*.log`,

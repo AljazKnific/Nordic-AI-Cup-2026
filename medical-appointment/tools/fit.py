@@ -47,7 +47,11 @@ GRIDS: Dict[str, List] = {
     'LENGTH_PENALTY': [round(0.05 * i, 2) for i in range(0, 21)],       # 0 - 1.0
     'TARGET_SECONDS': [round(1.0 + 0.25 * i, 2) for i in range(0, 21)],  # 1.0 - 6.0
     'MAX_RUN_SENTENCES': [1, 2, 3, 4, 5, 6],
-    'PAD_SECONDS': [round(0.05 * i, 2) for i in range(0, 21)],          # 0 - 1.0
+    'TRIM_OPENERS': [0, 1],
+    # Negative is an *inset*: the sentence we return is wider than the gold
+    # passage more often than it is narrower, so shrinking has to be on the
+    # grid. It was not, which is why the first pad fit could only ever say 0.0.
+    'PAD_SECONDS': [round(0.05 * i, 2) for i in range(-12, 21)],        # -0.6 - 1.0
 }
 
 PASSES = 4
