@@ -22,10 +22,17 @@ os.environ.setdefault('ANSWER_DEADLINE', '100000')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import transcripts  # noqa: E402
-from answering import answer_conversation  # noqa: E402
+from answering import SELECT_TASK, answer_conversation  # noqa: E402
 from utils import group_questions_by_conversation  # noqa: E402
 
 OUT = Path(__file__).resolve().parent.parent / 'diagnostics' / 'replies.json'
+
+# How a selection prompt is told from an answer prompt. Taken from SELECT_TASK
+# itself rather than written out here: a literal copy goes stale the moment the
+# prompt is re-worded, and the failure is silent -- selection replies would be
+# filed as answers, advancing the cursor and misaligning every later reply.
+_SELECT_MARKER = next(
+    line for line in SELECT_TASK.splitlines() if line.strip())
 
 
 def main() -> int:
@@ -59,7 +66,7 @@ def main() -> int:
         current = {'id': None}
 
         def recording(prompt, timeout=None, _order=order, _rows=rows):
-            selecting = 'Which passage' in prompt
+            selecting = _SELECT_MARKER in prompt
             text = ollama_client.answer(prompt)
             if selecting:
                 if current['id'] is not None:

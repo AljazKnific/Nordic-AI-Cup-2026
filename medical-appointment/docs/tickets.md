@@ -63,6 +63,7 @@ for this account. Local `main` is stale at 0.692.
 | 7 | Mention selection: sentence choice shipped (0.745 -> 0.759); segment choice **declined with evidence** — see below |
 | 12 | Extent constants fitted under leave-one-out CV. 0.759 -> 0.767 |
 | 13 | Abbreviation guard in `sentences_of`; per-call LLM timeout bounded by the budget |
+| 14 | Second pass: **declined with evidence** — loses in both wordings. See below |
 
 ## Where the remaining loss actually is (2026-09-19)
 
@@ -249,18 +250,80 @@ binds once at import, so a fitter setting `REACH_SECONDS` would silently leave
 the halves stale. A dead parameter that can quietly report the wrong number is
 worse than no parameter.
 
+**Re-wording what the first pass quotes.** The quote instruction is at a local
+optimum, measured in four directions against the frozen replies (baseline
+0.768, `tools/replay.py`, seconds per run):
+
+| change to the quote | score |
+| --- | --- |
+| baseline | **0.768** |
+| trimmed to its first sentence | 0.734 |
+| trimmed to its last sentence | 0.746 |
+| trimmed to the sentence sharing most question words | 0.754 |
+| widened out to the whole sentences it touches | 0.759-0.765 |
+
+**36% of quotes carry more than one sentence while 72% of gold passages are a
+single one**, so "quote exactly one sentence" looks like free points. It is not:
+the extra words are load-bearing, because they widen the anchor the candidate
+ranking scores `kept` against. Trimming and widening both lose, which is what a
+local optimum looks like. The trim-to-best-word variant is the closest offline
+proxy for actually asking the model, and it loses by 0.014.
+
+**Two smaller first-pass ideas, both dead on the measurement:**
+
+- *Reordering the reply JSON so the quote precedes the segment index*, on the
+  theory that the model commits to a number before it writes the words. Of 191
+  yes-quotes, 160 match inside the segment named and **2** match only in a
+  different one. Worth about +0.002; not worth a capture.
+- *Pressing harder on "copy the quote exactly".* 15% of quotes do not copy
+  exactly — and they score **higher** (0.708 against 0.619). The longest-run
+  matcher already absorbs the drift, and a paraphrase tends to mark a focused
+  answer. There is nothing here to fix.
+
 **Matching a quote across all segments when the named index looks off by one.**
 This deletes the segment-scoped match, which `answering.py` documents as
 load-bearing: it is the only thing stopping a phrase repeated later in the
 consultation from dragging the span to the wrong mention. It aims at
 `wrong-mention`, where the prompt route already scored 0.737 against 0.759.
 
-## Still to do
+### 14: The second pass — built, measured, and **declined** (2026-09-20)
 
-### 14: The second pass — built, off, waiting on a capture
+**Do not turn this on.** Three full `tools/score.py` runs back to back, live
+against qwen3:14b, with `ANSWER_DEADLINE` lifted so the budget could not
+suppress the escalation — this measured the prompt, not the gate:
 
-**Blocked by:** the timeout question. Do not turn this on until an attempt runs
-clean with `REQUEST_LOG_DIR` set and `arrival-to-work` is known.
+| run | accuracy | mean tIoU | score |
+| --- | --- | --- | --- |
+| second pass **off** | 0.990 | 0.621 | **0.768** |
+| current `SELECT_TASK` | 0.990 | 0.589 | 0.749 |
+| a redefined `SELECT_TASK` | 0.990 | 0.593 | 0.752 |
+
+The `off` run reproduced the replayed 0.768 exactly, so the two below are the
+prompt and not sampling noise. **Shown five overlapping extracts, the model
+chooses worse than the heuristic that ranked them.** Accuracy never moves,
+as designed: the second pass only ever touches spans.
+
+The redefinition named the annotation convention instead of asking which
+passage answers the question — *"choose the shortest passage that states the
+answer by itself; one that carries a neighbouring sentence beyond that
+statement is wrong, and so is one that cuts the statement short"*, which is the
+actual choice, since the candidates are overlapping extracts of the same words
+and two of them usually do answer it. It is worth **+0.003 against the current
+wording and −0.016 against off**. Better wording, same verdict.
+
+**Where that lands against the ceiling.** The gated ceiling is +0.017 and the
+gated floor −0.112. Spread over the 61 questions the gate fires on, −0.016
+overall is about 0.52 mean tIoU where the heuristic returns 0.609 and a perfect
+chooser would return 0.702. So the model is well above a worst-case chooser and
+below the heuristic — it is not noise, it is a worse ranker.
+
+**What would have to change for this to be worth re-opening.** Not the wording:
+two of them now bracket the result. Either a model that can rank overlapping
+extracts, or a different question to ask it than "which of these five".
+
+The design notes below are kept because they are what makes the decline
+legible — the gate measurement in particular is a finding about where the
+headroom sits, not about the second pass.
 
 Ranking candidate passages today means counting how many of the question's
 content words each carries. That signal is **spent**: the three constants
@@ -304,6 +367,8 @@ under. Judge this one with `tools/score.py`, not replay.
 
     SECOND_PASS=1 ./.venv/bin/python tools/capture_replies.py --out diagnostics/replies_second.json
     SECOND_PASS=1 ./.venv/bin/python tools/score.py
+
+## Still to do
 
 ### 12: More extent fitting, if anyone returns to it
 
@@ -376,6 +441,13 @@ with headroom left, and it is honest headroom — the passage was reachable from
 segment the model named and we chose the wrong sentences inside it. Iterate with
 `tools/replay.py` (frozen replies, under a second); only a change to which segment
 the model *names* needs a fresh 10-minute capture.
+
+**Two routes into it are now closed.** Asking the model to choose among the
+candidate sentence runs loses in both wordings (ticket 14), and re-wording what
+the first pass quotes loses in all four directions measured (see the declines).
+What is left is the *ranking* — `ANCHOR_WEIGHT`, `LENGTH_PENALTY`,
+`TARGET_SECONDS` — and all three were fitted and none moved. Read that as a
+warning about the size of what remains here, not as an invitation.
 
 ## Numbers worth not re-deriving
 
