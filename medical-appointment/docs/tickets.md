@@ -16,11 +16,26 @@ conversation, 45.3 s at worst — 76% of the 60 s budget** (`conversation_sample
 29.8 s of it transcription). The log is `diagnostics/e2e_after.log`, which is gitignored: re-run
 `local_evaluator.py` to regenerate it.
 
-**On the hosted validation set the score was 0.59**, because three of nineteen
-conversations exceeded the 60 s budget and a timeout costs all ten of its marks.
-Both causes are fixed, and the fixes now have an end-to-end run behind them.
-**The hosted number itself is still unknown** — only a submission can produce it,
-and that is the one thing left that this machine cannot do.
+**On the hosted set the score is 0.69** (2026-09-18, no errors), up from **0.59**
+before the timeout fixes. Three of nineteen conversations used to exceed the 60 s
+budget and a timeout costs all ten of its marks; +0.10 is about what those three
+were worth, which closes the question of whether the gap was infrastructure or
+modelling. It was infrastructure.
+
+**0.69 hosted against 0.759 local is not a regression.** The hosted conversations
+are a different, unseen set — longer, on the evidence of their timings — so the
+two numbers do not compare directly. The comparison that holds is 0.59 -> 0.69 on
+the same hosted set.
+
+**The margin there is thinner than it is here.** Over the 21 requests the service
+sent (`sample_3` three times, which reads as a retry after its first took 51.0 s),
+three conversations came within 9-11 s of the timeout: `sample_7` 50.2 s,
+`sample_26` 50.9 s, `sample_31` 49.1 s, against a worst case of 45.3 s over the
+supplied 39. Transcription is the pressure — 30.2 s of `sample_7` alone — and
+answering ran at 1.6-2.1 s per question against 1.1-1.5 s locally. If the audio
+gets longer or the host busier, that margin is where the next marks go, and
+`TRANSCRIBE_BUDGET` is the lever: an environment variable, no code change. The
+log is archived at `diagnostics/hosted_attempt_2026-09-18.log` (gitignored).
 
 Work lives on branch `aljaz-medical`, pushed to the `fork` remote
 (`AljazKnific/Nordic-AI-Cup-2026`). `origin` is the team repo and is read-only
@@ -74,16 +89,16 @@ straddling zero. Not shipped.
 
 ## Still to do
 
-### 10: Submit, and merge
+### 10: Merge
 
 **Blocked by:** None.
 
-The only number nobody can produce on this machine is the hosted one. Everything
-that cost the last attempt 0.12 of score is fixed and has a clean end-to-end run
-behind it; what remains is to submit and read the result.
+The submission is done and the number is above. What remains is getting the work
+onto the team repo.
 
-- [ ] A hosted validation run, with the endpoint served under `caffeinate`
-- [ ] The hosted score recorded here, beside the local 0.759
+- [x] A hosted validation run, with the endpoint served under `caffeinate` — 0.69,
+      no errors, 2026-09-18
+- [x] The hosted score recorded here, beside the local 0.759
 - [ ] A PR from `fork/aljaz-medical` to the team repo, or write access on `origin`.
       Note the fork is public
 
