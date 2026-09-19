@@ -50,9 +50,23 @@ def main() -> int:
         pending = [row['question_id'] for row in rows]
         order = iter(pending)
 
+        # The second pass makes a *second* call for some questions. Advancing
+        # the question order on those would file every later reply under the
+        # wrong id and misalign the whole capture from that point -- silently,
+        # because the file would still look complete. Only answer prompts move
+        # the cursor; a selection reply is filed beside the question it belongs
+        # to, under "<question_id>#select".
+        current = {'id': None}
+
         def recording(prompt, timeout=None, _order=order, _rows=rows):
+            selecting = 'Which passage' in prompt
             text = ollama_client.answer(prompt)
-            captured[next(_order)] = text
+            if selecting:
+                if current['id'] is not None:
+                    captured[f'{current["id"]}#select'] = text
+                return text
+            current['id'] = next(_order)
+            captured[current['id']] = text
             return text
 
         answer_conversation(segments, [row['question'] for row in rows], recording)
@@ -60,7 +74,10 @@ def main() -> int:
         Path(args.out).write_text(json.dumps(captured, indent=1))
 
     Path(args.out).write_text(json.dumps(captured, indent=1))
-    print(f'{len(captured)} replies -> {args.out} in {time.perf_counter() - started:.1f} s')
+    answers = sum(1 for k in captured if not k.endswith('#select'))
+    picks = len(captured) - answers
+    print(f'{answers} replies ({picks} second-pass choices) -> {args.out} '
+          f'in {time.perf_counter() - started:.1f} s')
     return 0
 
 

@@ -257,6 +257,54 @@ consultation from dragging the span to the wrong mention. It aims at
 
 ## Still to do
 
+### 14: The second pass — built, off, waiting on a capture
+
+**Blocked by:** the timeout question. Do not turn this on until an attempt runs
+clean with `REQUEST_LOG_DIR` set and `arrival-to-work` is known.
+
+Ranking candidate passages today means counting how many of the question's
+content words each carries. That signal is **spent**: the three constants
+weighting it were all fitted and none moved. A *perfect* choice among the same
+shortlist is worth **+0.068 mean tIoU, +0.041 of score** — the largest remaining
+item on the evidence side, and about twenty times the inset.
+
+So `SECOND_PASS=1` shows the model the shortlist the heuristic already built and
+asks which passage answers the question. That is extraction from five numbered
+lines, not the recall the earlier prompt experiment asked for and lost.
+
+**The gate, and the awkward measurement in it.** Score closeness alone fires on
+92% of questions, because candidates tie on shared-word count constantly. Adding
+a minimum separation *in time* between the top two is what does the work:
+
+| min gap | fires on | headroom reachable |
+| --- | --- | --- |
+| 0.0 s | 92% | 98% |
+| 1.0 s | 88% | 95% |
+| **2.0 s** | **32%** | **43%** |
+
+**The cliff is the finding: the headroom is spread thinly across most questions,
+not concentrated in a few ambiguous ones.** There is no gate that is both cheap
+and complete. The shipped default (2.0 s) costs ~1.6 extra calls a conversation
+— about 1.6 s hosted — for a *ceiling* of +0.018 score, and the model will not
+reach its ceiling. Ungated is +0.041 at ~9 extra calls, or ~10 s hosted, which
+is only affordable if the arrival-clock fix has genuinely recovered headroom.
+
+Everything fails safe: a refusal, an unreadable reply, an out-of-range number or
+too little time all keep the span the heuristic already chose. Seven tests pin
+that, including that the selection prompt still opens with the shared header
+(ADR-0001) and that a confident ranking is never escalated.
+
+**Capturing it.** `tools/capture_replies.py` used to advance the question cursor
+on every call, so a second call would have filed every later reply under the
+wrong id and misaligned the whole capture *silently*. Fixed: selection replies
+are filed as `<question_id>#select`. Note `tools/replay.py` cannot re-score a
+second-pass run from frozen replies alone — the shortlist depends on the current
+constants, so a recorded choice is only valid for the constants it was captured
+under. Judge this one with `tools/score.py`, not replay.
+
+    SECOND_PASS=1 ./.venv/bin/python tools/capture_replies.py --out diagnostics/replies_second.json
+    SECOND_PASS=1 ./.venv/bin/python tools/score.py
+
 ### 12: More extent fitting, if anyone returns to it
 
 **Blocked by:** Nothing. Read the protocol note below before re-running.

@@ -52,6 +52,68 @@ Answerer = Callable[..., str]
 # call that starts just inside the deadline free to return long after it.
 DEADLINE_SECONDS = float(os.environ.get('ANSWER_DEADLINE', '35'))
 
+# --- The second pass -------------------------------------------------------
+#
+# Off by default. Ranking candidate passages today means counting how many of
+# the question's content words each one carries, and that signal is spent: the
+# three constants weighting it (ANCHOR_WEIGHT, LENGTH_PENALTY, TARGET_SECONDS)
+# were all fitted and none of them moved. Meanwhile a *perfect* choice among the
+# same shortlist is worth +0.068 mean tIoU, or +0.041 of final score -- the
+# largest remaining item on the evidence side.
+#
+# So the second pass shows the model the shortlist the heuristic already built
+# and asks which passage answers the question. That is an extraction from five
+# numbered lines, not the recall the earlier prompt experiment asked for and
+# lost (0.737 against 0.759).
+#
+# **It is gated, because it is not free.** An ungated second call per question
+# adds 20-25 s to a hosted conversation, and timeouts have cost more than every
+# modelling change here put together. It fires only when the top two candidates
+# are within SELECT_MARGIN of each other -- if the heuristic is confident there
+# is nothing to ask -- and only when there is time to spare.
+SECOND_PASS = os.environ.get('SECOND_PASS', '') not in ('', '0', 'false')
+
+# How close the top two have to be before the choice is worth a call. Score
+# units are "question content words shared", so 1.0 means a clear winner is left
+# alone and a tie or near-tie is escalated.
+SELECT_MARGIN = float(os.environ.get('SELECT_MARGIN', '1.0'))
+
+# ...and how far apart they have to be *in time*. A near-tie between two spans
+# that name nearly the same seconds is not a question worth asking. This is the
+# condition that does the gating work: on score alone the gate fires on 92% of
+# questions, because candidates tie on shared-word count constantly.
+#
+# The measured trade, over the 39 supplied conversations, where "headroom" is
+# the +0.068 mean tIoU a perfect choice among the shortlist would win:
+#
+#   min gap   fires on   headroom reachable
+#   0.0 s        92%           98%
+#   1.0 s        88%           95%
+#   2.0 s        31%           43%
+#
+# That cliff is the finding: the headroom is spread thinly across most
+# questions rather than concentrated in a few ambiguous ones, so there is no
+# gate that is both cheap and complete. 2.0 s is the honest compromise -- about
+# three extra calls a conversation for a little under half the available gain.
+SELECT_MIN_GAP = float(os.environ.get('SELECT_MIN_GAP', '2.0'))
+
+# Never start a second call with less than this left: it must not be the thing
+# that pushes a conversation over the budget.
+SELECT_MIN_SECONDS = float(os.environ.get('SELECT_MIN_SECONDS', '6'))
+
+# The shortlist shown to the model. Long lists cost tokens and invite the model
+# to pick from the middle; five is the median number of candidates anyway.
+SELECT_SHORTLIST = int(os.environ.get('SELECT_SHORTLIST', '5'))
+
+SELECT_TASK = """
+Which passage below is the one that answers this question?
+
+Question: %s
+
+%s
+Reply with the number of that passage only, as a plain integer.
+"""
+
 TASK = """
 Answer the question below using only the consultation above.
 
@@ -86,6 +148,48 @@ def build_transcript_header(segments: Sequence[Dict[str, Any]]) -> str:
 def build_prompt(header: str, question: str) -> str:
     """Header first, always. The task and the question go after it."""
     return header + TASK + question + '\n'
+
+
+def build_selection_prompt(
+    header: str, question: str, candidates: Sequence['Candidate'],
+) -> str:
+    """The second pass's prompt. Same header, so the cached prefix still holds.
+
+    Sharing the header is the whole reason this is affordable: the transcript
+    is already in Ollama's cache from the first call, so only the short tail
+    below is evaluated. Putting anything before the header would cost ~70 s a
+    conversation and nothing would report it (ADR-0001).
+    """
+    lines = '\n'.join(
+        f'[{n + 1}] {candidate.text}' for n, candidate in enumerate(candidates))
+    return header + SELECT_TASK % (question, lines)
+
+
+def ambiguous(candidates: Sequence['Candidate']) -> bool:
+    """Whether the top two are worth a call: close in score, apart in time."""
+    if len(candidates) < 2:
+        return False
+    if (candidates[0].score - candidates[1].score) >= SELECT_MARGIN:
+        return False
+    first, second = candidates[0].span, candidates[1].span
+    apart = abs(first[0] - second[0]) + abs(first[1] - second[1])
+    return apart > SELECT_MIN_GAP
+
+
+def parse_selection(text: str, count: int) -> Optional[int]:
+    """The 1-based number the model picked, as a 0-based index, or ``None``.
+
+    Anything unreadable or out of range returns ``None``, and the caller keeps
+    the heuristic's own choice. A second pass that cannot be understood must
+    cost nothing rather than a span.
+    """
+    if not text:
+        return None
+    match = re.search(r'\d+', text)
+    if not match:
+        return None
+    chosen = int(match.group(0)) - 1
+    return chosen if 0 <= chosen < count else None
 
 
 def _normalise(text: str) -> str:
@@ -332,34 +436,61 @@ def to_passage(
     question and closes with the patient's answer be returned whole, when the
     model quoted only one half of it.
     """
+    candidates = passage_candidates(span, sentences, question)
+    if candidates is None:
+        return _finish(span, sentences)
+    if not candidates:
+        touched = [s for s in sentences if _overlap(span, s) > _TOUCH_SECONDS]
+        return _plausible((touched[0].start, touched[-1].end), span, sentences)
+    return _plausible(candidates[0].span, span, sentences)
+
+
+class Candidate(NamedTuple):
+    """One run of neighbouring sentences, and how well it scored."""
+    score: float
+    span: Span
+    text: str
+
+
+def passage_candidates(
+    span: Span, sentences: Sequence[Sentence], question: Optional[str] = None,
+) -> Optional[List[Candidate]]:
+    """Every run of sentences worth considering, best first.
+
+    Split out of :func:`to_passage` so the ranking can be inspected, and so a
+    second pass can be offered the same shortlist the heuristic sees rather than
+    a different one. Returns ``None`` when the span lies in no sentence at all,
+    and an empty list when there is nothing to rank between.
+    """
     window = (span[0] - REACH_SECONDS, span[1] + REACH_SECONDS)
     near = [s for s in sentences if _overlap(window, s) > _TOUCH_SECONDS]
     touched = [s for s in sentences if _overlap(span, s) > _TOUCH_SECONDS]
     if not touched:
-        return _finish(span, sentences)
+        return None
 
-    whole = (touched[0].start, touched[-1].end)
     asked = _content_words(question) if question else set()
     if not asked or len(near) < 2:
-        return _plausible(whole, span, sentences)
+        return []
 
     located = max(span[1] - span[0], 0.1)
-    best: Optional[Tuple[float, Span]] = None
+    found: List[Candidate] = []
     for first in range(len(near)):
         for last in range(first, min(first + MAX_RUN_SENTENCES, len(near))):
             candidate = (near[first].start, near[last].end)
             if candidate[1] - candidate[0] > MAX_PASSAGE_SECONDS:
                 continue
-            shared = len(asked & _content_words(
-                ' '.join(s.text for s in near[first:last + 1])))
+            text = ' '.join(s.text for s in near[first:last + 1])
+            shared = len(asked & _content_words(text))
             kept = max(0.0, min(span[1], candidate[1])
                        - max(span[0], candidate[0])) / located
             score = (shared + ANCHOR_WEIGHT * kept
                      - LENGTH_PENALTY * max(
                          0.0, (candidate[1] - candidate[0]) - TARGET_SECONDS))
-            if best is None or score > best[0] + 1e-9:
-                best = (score, candidate)
-    return _plausible(best[1] if best else whole, span, sentences)
+            found.append(Candidate(score, candidate, text.strip()))
+    # Stable: equal scores keep the order they were generated in, which is
+    # earliest-and-shortest first, so the default choice does not move.
+    found.sort(key=lambda c: -c.score)
+    return found
 
 
 def _plausible(passage: Span, span: Span,
@@ -560,6 +691,59 @@ def answer_conversation(
             logger.info('FALLBACK no usable segment index (%r) for: %s', index, question)
             segment = _best_keyword_segment(segments, question)
 
-        results.append((True, resolve_span(segment, quote, sentences, question)))
+        span = resolve_span(segment, quote, sentences, question)
+        if SECOND_PASS:
+            span = _reconsider(
+                segment, quote, sentences, question, header, answerer,
+                deadline, span,
+            )
+        results.append((True, span))
 
     return results
+
+
+def _reconsider(
+    segment: Dict[str, Any],
+    quote: Optional[str],
+    sentences: Sequence[Sentence],
+    question: str,
+    header: str,
+    answerer: Answerer,
+    deadline: float,
+    fallback: Span,
+) -> Span:
+    """Ask the model to choose among the candidates, when the ranking is close.
+
+    Never raises and never returns ``None``: every way this can go wrong ends
+    with ``fallback``, the span the heuristic already chose. The second pass is
+    allowed to improve a span and never to cost one.
+    """
+    remaining = deadline - time.perf_counter()
+    if remaining < SELECT_MIN_SECONDS:
+        logger.info('SECOND-PASS skipped, %.1f s left', remaining)
+        return fallback
+
+    located = resolve_span(segment, quote, (), question)
+    candidates = passage_candidates(located, sentences, question)
+    if not candidates or not ambiguous(candidates):
+        return fallback
+
+    shortlist = candidates[:SELECT_SHORTLIST]
+    try:
+        reply = answerer(
+            build_selection_prompt(header, question, shortlist),
+            timeout=remaining,
+        )
+    except Exception:
+        logger.info('SECOND-PASS call failed; keeping the heuristic span')
+        return fallback
+
+    chosen = parse_selection(reply, len(shortlist))
+    if chosen is None:
+        logger.info('SECOND-PASS unreadable reply %r; keeping the heuristic span',
+                    (reply or '')[:60])
+        return fallback
+
+    picked = _plausible(shortlist[chosen].span, located, sentences)
+    logger.info('SECOND-PASS chose [%d] of %d', chosen + 1, len(shortlist))
+    return picked

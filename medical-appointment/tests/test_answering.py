@@ -362,3 +362,98 @@ class TestPassages:
 
         assert answer is True
         assert span is not None
+
+
+class TestTheSecondPass:
+    """It may improve a span. It may never cost one.
+
+    The second pass asks the model to choose among the candidate passages the
+    heuristic already built. Every failure -- a refusal, an unreadable reply, an
+    out-of-range number, no time left -- must land on the span we already had.
+    """
+
+    def test_it_is_off_by_default(self):
+        assert answering.SECOND_PASS is False
+
+    def test_an_unreadable_choice_keeps_the_heuristic_span(self, punctuated):
+        chosen = self._with_second_pass(punctuated, 'I could not say')
+        assert chosen == self._without(punctuated)
+
+    def test_a_number_out_of_range_keeps_the_heuristic_span(self, punctuated):
+        chosen = self._with_second_pass(punctuated, '99')
+        assert chosen == self._without(punctuated)
+
+    def test_a_failing_second_call_keeps_the_heuristic_span(self, punctuated):
+        def explode(prompt, timeout=None):
+            if 'Which passage' in prompt:
+                raise RuntimeError('model down')
+            return reply('yes', 2, 'after a meal')
+
+        original = answering.SECOND_PASS
+        answering.SECOND_PASS = True
+        try:
+            [(_, span)] = answer_conversation(
+                punctuated, ['Is it taken after a meal?'], explode)
+        finally:
+            answering.SECOND_PASS = original
+        assert span == self._without(punctuated)
+
+    def test_a_confident_ranking_is_never_escalated(self, punctuated):
+        """No call is made when the heuristic already has a clear winner."""
+        asked = []
+
+        def counting(prompt, timeout=None):
+            asked.append(prompt)
+            return reply('yes', 2, 'after a meal')
+
+        original_margin = answering.SELECT_MARGIN
+        original = answering.SECOND_PASS
+        answering.SECOND_PASS = True
+        answering.SELECT_MARGIN = 0.0   # nothing is ever close enough
+        try:
+            answer_conversation(punctuated, ['Is it taken after a meal?'], counting)
+        finally:
+            answering.SECOND_PASS = original
+            answering.SELECT_MARGIN = original_margin
+
+        assert len(asked) == 1, 'the second pass should not have been called'
+
+    def test_the_selection_prompt_still_opens_with_the_shared_header(self, punctuated):
+        """ADR-0001: break this and a conversation costs ~70 s with no signal."""
+        header = build_transcript_header(punctuated)
+        candidates = [answering.Candidate(1.0, (0.0, 1.0), 'first'),
+                      answering.Candidate(0.9, (2.0, 3.0), 'second')]
+        prompt = answering.build_selection_prompt(header, 'Why?', candidates)
+
+        assert prompt.startswith(header)
+        assert '[1] first' in prompt and '[2] second' in prompt
+
+    def test_parse_selection_reads_a_number_and_rejects_the_rest(self):
+        assert answering.parse_selection('2', 5) == 1
+        assert answering.parse_selection('The answer is [3].', 5) == 2
+        assert answering.parse_selection('9', 5) is None
+        assert answering.parse_selection('none of them', 5) is None
+        assert answering.parse_selection('', 5) is None
+
+    # --- helpers ---
+
+    def _without(self, punctuated):
+        answerer = replies(reply('yes', 2, 'after a meal'))
+        [(_, span)] = answer_conversation(
+            punctuated, ['Is it taken after a meal?'], answerer)
+        return span
+
+    def _with_second_pass(self, punctuated, selection):
+        def answerer(prompt, timeout=None):
+            if 'Which passage' in prompt:
+                return selection
+            return reply('yes', 2, 'after a meal')
+
+        original = answering.SECOND_PASS
+        answering.SECOND_PASS = True
+        try:
+            [(_, span)] = answer_conversation(
+                punctuated, ['Is it taken after a meal?'], answerer)
+        finally:
+            answering.SECOND_PASS = original
+        return span
