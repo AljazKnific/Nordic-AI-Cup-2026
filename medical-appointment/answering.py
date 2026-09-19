@@ -36,13 +36,20 @@ from utils import Span
 
 logger = logging.getLogger(__name__)
 
-Answerer = Callable[[str], str]
+# The answerer takes a prompt and the seconds of budget left, and returns the
+# model's raw reply. The budget is part of the seam on purpose: a deadline
+# checked only between calls cannot stop a single slow call from overrunning it.
+Answerer = Callable[..., str]
 
 # Stop calling the model once a conversation has cost this much. Ten sequential
 # calls at the client timeout would run to several minutes, and the budget is
 # 60 s averaged across the attempt -- overrunning early silently costs marks on
 # conversations that are then never sent. Past the deadline we guess, because a
 # guess is worth half a mark and silence ends the attempt.
+#
+# The deadline is enforced twice: once here, deciding whether to ask at all,
+# and once inside the call, bounding how long we wait. The first alone leaves a
+# call that starts just inside the deadline free to return long after it.
 DEADLINE_SECONDS = float(os.environ.get('ANSWER_DEADLINE', '35'))
 
 TASK = """
@@ -107,6 +114,19 @@ def segment_bounds(segment: Dict[str, Any]) -> Span:
 # stop the segment boundary truncating the sentence the match landed in.
 _SENTENCE_END = ('.', '?', '!')
 
+# Titles the ASR writes with a trailing stop, which is not the end of a
+# sentence. "Dr." alone accounts for 38 of the 2,132 boundaries the ASR emits
+# over the 39 supplied conversations, and every one of them fractures a sentence
+# that the gold annotation keeps whole.
+#
+# Titles *only*, and deliberately so. The other abbreviation-shaped tokens in
+# these transcripts are "no." (14) and "am." (4), and in a consultation both are
+# overwhelmingly genuine sentence ends -- "No." is an answer to a question, and
+# "I am." closes one. Guarding those would manufacture run-on sentences, which
+# cost far more than the split they prevent. Unit abbreviations ("mg.", "ml.")
+# appear zero times here, so adding them would be speculation, not a fix.
+_ABBREVIATIONS = frozenset({'dr.', 'mr.', 'mrs.', 'ms.', 'prof.', 'st.'})
+
 # A sentence merely abutting the span is not part of it.
 _TOUCH_SECONDS = 0.05
 
@@ -131,7 +151,10 @@ LENGTH_PENALTY = 0.2
 # sentences the quote itself touches puts those passages out of reach entirely.
 # One second buys them back; beyond about 1.5 s the gain flattens and the risk
 # of reaching into the next exchange grows.
-REACH_SECONDS = 1.0
+#
+# 1.25 rather than 1.0 because that is what fitting chose: see `tools/fit.py`,
+# where all 39 leave-one-conversation-out folds picked it independently.
+REACH_SECONDS = 1.25
 
 # Weight on how much of the located span a candidate still covers. Reaching
 # outward needs a counterweight, or a neighbouring sentence with one question
@@ -139,10 +162,34 @@ REACH_SECONDS = 1.0
 # purpose: it breaks ties towards the quote rather than overruling the terms.
 ANCHOR_WEIGHT = 0.5
 
-# Passages run to at most a few sentences; four is well past the longest
-# annotated one, and capping the run stops a candidate growing to cover a whole
-# exchange plus its neighbours.
-MAX_RUN_SENTENCES = 4
+# Passages run to at most a few sentences, and capping the run stops a candidate
+# growing to cover a whole exchange plus its neighbours.
+#
+# Two, not four. Four was chosen as "well past the longest annotated passage",
+# which was the wrong question: what matters is not whether a long run is ever
+# right but how often the extra length is wrong. A gold passage runs a median of
+# 2.88 s against a covering sentence run of 3.54 s, so the room a fourth
+# sentence buys is nearly always room to overshoot. Fitted, and every one of the
+# 39 leave-one-out folds chose 2 -- see `tools/fit.py`.
+MAX_RUN_SENTENCES = 2
+
+# A constant widening applied to both edges of the finished passage. Sentence
+# bounds and annotated bounds do not coincide exactly -- an annotation tends to
+# open a little before the first word and close a little after the last -- and
+# on the 39 supplied conversations the covering sentence run is *shorter* than
+# the gold passage in 16% of cases. One constant buys those back without
+# touching which sentences were chosen.
+#
+# Symmetric on purpose. A separate forward and backward reach was measured and
+# is worth +0.002 with a bootstrap interval straddling zero; splitting this into
+# two parameters would be re-buying that result with a new name.
+#
+# **Measured and worth nothing.** Fitting chose 0.0 in all 39 folds, so the
+# sentence bounds we already return are not systematically narrow after all.
+# Kept at zero, and kept as a search dimension in `tools/fit.py`, so the
+# negative result stays reproducible rather than becoming folklore. Do not
+# reintroduce a pad without new evidence.
+PAD_SECONDS = 0.0
 
 # Too common to say anything about which sentence answers a question. Kept small
 # and generic on purpose: a medical lexicon here would be fitted to the 39
@@ -180,12 +227,20 @@ def sentences_of(segments: Sequence[Dict[str, Any]]) -> List[Sentence]:
     for segment in segments:
         for word in _words_of(segment):
             current.append(word)
-            if str(word.get('word', '')).rstrip().endswith(_SENTENCE_END):
+            if _ends_sentence(word):
                 found.append(_sentence(current))
                 current = []
     if current:
         found.append(_sentence(current))
     return found
+
+
+def _ends_sentence(word: Dict[str, Any]) -> bool:
+    """Whether this word closes a sentence, or merely carries a trailing stop."""
+    token = str(word.get('word', '')).strip()
+    if not token.endswith(_SENTENCE_END):
+        return False
+    return token.casefold() not in _ABBREVIATIONS
 
 
 def _sentence(words: Sequence[Dict[str, Any]]) -> Sentence:
@@ -221,7 +276,7 @@ def to_passage(
     near = [s for s in sentences if _overlap(window, s) > _TOUCH_SECONDS]
     touched = [s for s in sentences if _overlap(span, s) > _TOUCH_SECONDS]
     if not touched:
-        return span
+        return _padded(span)
 
     whole = (touched[0].start, touched[-1].end)
     asked = _content_words(question) if question else set()
@@ -252,8 +307,15 @@ def _plausible(passage: Span, span: Span) -> Span:
     if passage[1] - passage[0] > MAX_PASSAGE_SECONDS:
         logger.info('FALLBACK sentence longer than %.0f s; keeping the located span',
                     MAX_PASSAGE_SECONDS)
-        return span
-    return passage
+        return _padded(span)
+    return _padded(passage)
+
+
+def _padded(passage: Span) -> Span:
+    """The passage widened by the constant offset, never before the recording."""
+    if not PAD_SECONDS:
+        return passage
+    return (max(0.0, passage[0] - PAD_SECONDS), passage[1] + PAD_SECONDS)
 
 
 def resolve_span(
@@ -402,7 +464,12 @@ def answer_conversation(
             continue
 
         try:
-            answer, index, quote = parse_reply(answerer(build_prompt(header, question)))
+            # What is left of the budget, so a slow or cold call fails inside it
+            # rather than running past it. The check above decides whether to
+            # ask; this decides how long we are willing to wait for the answer.
+            remaining = deadline - time.perf_counter()
+            reply = answerer(build_prompt(header, question), timeout=remaining)
+            answer, index, quote = parse_reply(reply)
         except Exception:
             logger.exception('Answerer failed; guessing for: %s', question)
             answer, index, quote = None, None, None

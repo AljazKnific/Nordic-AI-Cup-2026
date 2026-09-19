@@ -45,7 +45,7 @@ def segments():
 
 
 def answerer_returning(text):
-    return lambda prompt: text
+    return lambda prompt, timeout=None: text
 
 
 class TestContract:
@@ -102,7 +102,7 @@ class TestBudget:
             pipeline.REQUEST_BUDGET_SECONDS = -1.0
             return segments
 
-        def answerer(prompt):
+        def answerer(prompt, timeout=None):
             asked.append(prompt)
             return 'no'
 

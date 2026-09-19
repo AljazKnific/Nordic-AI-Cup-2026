@@ -11,6 +11,7 @@ prompt prefix, which is the whole saving (ADR-0001).
 import logging
 import os
 import time
+from typing import Optional
 
 import requests
 
@@ -26,9 +27,16 @@ TIMEOUT_SECONDS = float(os.environ.get('OLLAMA_TIMEOUT', '30'))
 # ~26 tok/s, so an unbounded reply is a budget risk, not just a slow one.
 MAX_TOKENS = 160
 
-# Ollama defaults to a 4096-token context. A transcript prompt runs to ~10,600,
-# so the default silently truncates the conversation -- and a question answered
-# from a truncated transcript looks like a model failure, not a config one.
+# Never wait less than this, even when the budget says so. A sub-second timeout
+# cannot produce an answer and only turns a slow call into a failed one; the
+# caller's deadline check is what decides whether to ask at all.
+MIN_TIMEOUT_SECONDS = 1.0
+
+# Ollama defaults to a 4096-token context and silently truncates past it -- and
+# a question answered from a truncated transcript looks like a model failure
+# rather than a config one. The largest prompt measured over the 39 supplied
+# conversations is 1,920 tokens, so this is generous on purpose: the evaluation
+# audio is unseen and, on the evidence of its timings, longer.
 CONTEXT_TOKENS = int(os.environ.get('OLLAMA_NUM_CTX', '16384'))
 
 # Ollama unloads an idle model after about five minutes. Waiting in a
@@ -38,9 +46,21 @@ CONTEXT_TOKENS = int(os.environ.get('OLLAMA_NUM_CTX', '16384'))
 KEEP_ALIVE = os.environ.get('OLLAMA_KEEP_ALIVE', '60m')
 
 
-def answer(prompt: str) -> str:
-    """Send one prompt, return the model's raw reply text."""
+def answer(prompt: str, timeout: Optional[float] = None) -> str:
+    """Send one prompt, return the model's raw reply text.
+
+    ``timeout`` is the seconds of budget the caller has left. Without it a slow
+    or cold request blocks for :data:`TIMEOUT_SECONDS` regardless of how little
+    time remains, which is how a request overruns a deadline that is checked
+    only *between* calls: the check passes at 49 s and the call returns at 79 s.
+    Capped by ``TIMEOUT_SECONDS`` either way -- no single call is worth longer
+    than that even when the budget would allow it.
+    """
     started = time.perf_counter()
+    if timeout is None:
+        timeout = TIMEOUT_SECONDS
+    else:
+        timeout = max(MIN_TIMEOUT_SECONDS, min(timeout, TIMEOUT_SECONDS))
     response = requests.post(
         f'{HOST}/api/generate',
         json={
@@ -55,7 +75,7 @@ def answer(prompt: str) -> str:
                 'num_ctx': CONTEXT_TOKENS,
             },
         },
-        timeout=TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     response.raise_for_status()
     payload = response.json()

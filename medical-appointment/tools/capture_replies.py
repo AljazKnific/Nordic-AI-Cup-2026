@@ -50,7 +50,7 @@ def main() -> int:
         pending = [row['question_id'] for row in rows]
         order = iter(pending)
 
-        def recording(prompt, _order=order, _rows=rows):
+        def recording(prompt, timeout=None, _order=order, _rows=rows):
             text = ollama_client.answer(prompt)
             captured[next(_order)] = text
             return text

@@ -48,7 +48,7 @@ def replies(*canned):
     prompts = []
     queue = list(canned)
 
-    def answerer(prompt):
+    def answerer(prompt, timeout=None):
         prompts.append(prompt)
         return queue.pop(0)
 
@@ -120,7 +120,7 @@ class TestSpans:
 
         asked = []
 
-        def slow(prompt):
+        def slow(prompt, timeout=None):
             asked.append(prompt)
             return reply('no')
 
@@ -133,6 +133,29 @@ class TestSpans:
 
         assert asked == []
         assert all(answer is True and span is not None for answer, span in results)
+
+    def test_each_call_is_bounded_by_what_is_left_of_the_budget(self, segments):
+        """A deadline checked only between calls cannot stop one slow call.
+
+        The check decides whether to ask; the timeout decides how long we wait.
+        Without the second, a call starting just inside the deadline returns
+        long after it, and the request misses the budget it was protecting.
+        """
+        import time
+
+        seen = []
+
+        def recording(prompt, timeout=None):
+            seen.append(timeout)
+            return reply('no')
+
+        deadline = time.perf_counter() + 5.0
+        answer_conversation(segments, ['a?', 'b?', 'c?'], recording, deadline=deadline)
+
+        assert len(seen) == 3
+        assert all(t is not None and 0 < t <= 5.0 for t in seen)
+        # Each call is handed less than the one before it.
+        assert seen == sorted(seen, reverse=True)
 
     def test_yes_never_returns_a_null_span(self, segments):
         """A wrong span scores the same as none; null is guaranteed zero."""
@@ -188,7 +211,7 @@ class TestMalformedReplies:
         assert span is not None
 
     def test_a_raising_answerer_costs_one_question_not_the_conversation(self, segments):
-        def answerer(prompt):
+        def answerer(prompt, timeout=None):
             raise RuntimeError('ollama fell over')
 
         results = answer_conversation(segments, ['a?', 'b?', 'c?'], answerer)
