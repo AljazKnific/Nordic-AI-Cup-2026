@@ -14,6 +14,7 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+import request_log
 from answering import Answerer, answer_conversation
 from dtos import ASRQuestionRequestDto, ASRQuestionResponseDto
 from utils import audio_duration_seconds, decode_audio
@@ -84,6 +85,11 @@ def predict(
     started = arrived if arrived is not None else time.perf_counter()
     questions: Sequence[str] = request.questions
     duration: Optional[float] = None
+    # Write-only, and off unless REQUEST_LOG_DIR is set. The evaluation audio is
+    # unseen, so this is the only way to read back what the ASR heard.
+    record = request_log.Record(request.audio_filename)
+    if request_log.enabled():
+        answerer = record.recording(answerer)
 
     try:
         audio_bytes = decode_audio(request.audio_base64)
@@ -107,6 +113,11 @@ def predict(
             deadline=started + REQUEST_BUDGET_SECONDS,
         )
         answering_seconds = time.perf_counter() - answering_started
+        record.note(
+            audio_seconds=duration,
+            questions=list(questions),
+            transcript=request_log.transcript_of(segments),
+        )
     except Exception:
         # Whatever went wrong, a guess for every question beats no reply at all:
         # a coin toss is worth half a mark, an error is worth nothing, and
@@ -115,6 +126,8 @@ def predict(
         logger.exception('Pipeline failed for %s; guessing every question', request.audio_filename)
         logger.info('TIMING %s: failed after %.1f s',
                     request.audio_filename, time.perf_counter() - started)
+        record.note(failed=True, seconds=round(time.perf_counter() - started, 2))
+        record.write()
         return _guess(len(questions), duration)
 
     answers: List[bool] = []
@@ -136,6 +149,19 @@ def predict(
         answering_seconds / len(questions) if questions else 0.0,
         total,
     )
+
+    record.note(
+        answers=answers,
+        evidence_start=starts,
+        evidence_end=ends,
+        timings={
+            'arrival_to_work': round(transcription_started - started, 2),
+            'transcribe': round(transcription_seconds, 2),
+            'answer': round(answering_seconds, 2),
+            'total': round(total, 2),
+        },
+    )
+    record.write()
 
     return ASRQuestionResponseDto(
         answers=answers, evidence_start=starts, evidence_end=ends,
