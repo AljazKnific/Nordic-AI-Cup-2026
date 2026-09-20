@@ -102,6 +102,81 @@ against the 0.621 we return. Better ASR, forced alignment and diarisation all
 raise a ceiling that is already 0.31 above where we stand. The gap is in
 *choosing* sub-sentence bounds from timings we hold, not in getting better ones.
 
+## Is "extract less" a lever? Capped at +0.016, and every gate loses (2026-09-20)
+
+The standing intuition is that we hand back too much around the annotated
+passage and that a prompt could tell the model to be terser. Measured with
+`tools/extent.py`, which reproduces all of the below in a second from the frozen
+replies.
+
+**The direction is right.** Over the 191 questions answered yes, dropping every
+second we return that gold does not would be worth **+0.173 mean tIoU**; covering
+every second of gold we miss would be worth **+0.072**. Over-inclusion is the
+larger half, as `tools/disagreements.py` already said.
+
+**But almost none of it is reachable by returning fewer sentences.** We return
+more sentences than the annotation touches on 25 of 191 questions and *fewer* on
+31; the modal case is 113 questions where we and gold occupy the same single
+sentence and we score 0.714 on it. The 25 over-runs are the visible failure —
+they score 0.372 — but they are 13% of the set, and the blunt fix takes the 22
+questions where two sentences are right (0.836) with them:
+
+| how far a passage may run | mean tIoU | delta |
+| --- | --- | --- |
+| always one sentence | 0.5918 | **-0.0419** |
+| as many as the model's quote spans, capped at two | 0.6175 | **-0.0163** |
+| today: up to two | 0.6338 | — |
+| always three | 0.6300 | -0.0037 |
+| **oracle**, as many as gold touches | 0.6597 | **+0.0260** |
+
+**That oracle row is the finding.** A signal that decided "one sentence or two"
+*perfectly* — a new prompt field, a second pass, a classifier, anything — is
+worth **+0.026 mean tIoU, or +0.016 of final score**, and only if it is never
+wrong. The one time the model has been asked to make a comparable judgement it
+came out below the heuristic (ticket 14). This is the ceiling on the whole
+"tell it to extract less" direction, and it is smaller than the +0.0131 the
+extent fitting already collected for free.
+
+**The quote's own width is not the signal either.** When the model's quote lands
+in one sentence, gold is one sentence 78% of the time; when it spans two or more,
+62%. A gate needs those to differ and they barely do — hence the -0.0163 above.
+
+**And it is not really a width problem.** Of the questions where the ranking's
+shortlist held a better candidate than the one it chose, 22 wanted a *shorter*
+span and 14 wanted a *longer* one. A rule that only ever narrows cannot collect a
+third of the available gain. The full oracle over that shortlist is +0.072 mean
+tIoU, which is the same number ticket 14 was built against and lost.
+
+**Three more narrowing ideas, each measured and each negative.** Penalising a run
+whose extra sentence adds no question word the anchor sentence did not already
+have: **-0.0127 to -0.0157** at every penalty from 0.25 to 5.0. `LENGTH_PENALTY`
+away from its fitted 0.2 in either direction: -0.019 at 0.1, -0.019 at 0.3.
+`ANCHOR_WEIGHT` away from 0.5: -0.026 at 0.25, -0.019 at 1.0. The ranking sits in
+a sharp local optimum in every direction tried.
+
+**A sentence-numbered transcript header was considered and is not worth a
+capture.** Numbering sentences instead of ASR segments would let the model name
+the unit we actually return, and it is 1.12x the header size — affordable. But
+the proxy kills it: returning *just* the sentence the model's quote lands in
+scores **0.559 against today's 0.634**, so the reach-and-run machinery it would
+replace is worth +0.075 on its own, and the quote already picks the best single
+sentence 76% of the time against a perfect-naming ceiling of 0.706. The model
+would have to name sentences near-perfectly to break even on a design that starts
+0.075 behind.
+
+**Nor is trimming the header.** The per-segment timestamps the model never uses
+are 20% of it, ~112 tokens a conversation, ~0.6 s of prefill once per
+conversation against a 60 s budget whose variable half is 30 s of transcription.
+Not a timing lever.
+
+**What this leaves.** Extent is fitted out and the prompt cannot reach past
++0.016 even perfectly. The remaining evidence loss is *which* sentence, not how
+far it runs, and that has now been attacked three times — last-mention (0.737),
+the gated second pass (0.749/0.752), and the gates above. The untried lever is
+the one the ceiling table points at: our 0.634 against 0.929 for the best word
+run the existing ASR timings already support. Sub-sentence bounds, not fewer
+sentences.
+
 ## The 0.61 run, and what it taught (2026-09-19)
 
 A hosted attempt after the fitting work scored **0.61**, down from 0.69, with two
@@ -497,6 +572,8 @@ shared prefix is warm.
 ./.venv/bin/python tools/score.py --limit 5
 ./.venv/bin/python tools/replay.py        # frozen replies, seconds
 ./.venv/bin/python tools/replay.py --diagnose
+./.venv/bin/python tools/disagreements.py  # which direction the error runs
+./.venv/bin/python tools/extent.py         # is "extract less" a lever? seconds
 ./.venv/bin/python local_evaluator.py     # a whole attempt through the live server, ~20 min
 caffeinate -dimsu ./.venv/bin/python api.py
 ```
