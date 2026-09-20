@@ -20,12 +20,16 @@ from pathlib import Path
 os.environ.setdefault('ANSWER_DEADLINE', '100000')
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import answering  # noqa: E402
+import prompts  # noqa: E402
 import transcripts  # noqa: E402
 from answering import SELECT_TASK, answer_conversation  # noqa: E402
 from utils import group_questions_by_conversation  # noqa: E402
 
-OUT = Path(__file__).resolve().parent.parent / 'diagnostics' / 'replies.json'
+DIAGNOSTICS = Path(__file__).resolve().parent.parent / 'diagnostics'
+OUT = DIAGNOSTICS / 'replies.json'
 
 # How a selection prompt is told from an answer prompt. Taken from SELECT_TASK
 # itself rather than written out here: a literal copy goes stale the moment the
@@ -38,8 +42,23 @@ _SELECT_MARKER = next(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--limit', type=int, default=None)
-    parser.add_argument('--out', default=str(OUT))
+    parser.add_argument('--out', default=None)
+    parser.add_argument('--variant', default=None,
+                        help=f'a prompt from tools/prompts.py: '
+                             f'{", ".join(prompts.ALL)}')
     args = parser.parse_args()
+
+    # The task text is swapped in memory rather than edited into answering.py,
+    # so a capture cannot leave the shipped prompt changed behind it -- and so
+    # two variants can be captured back to back without a stale .pyc between
+    # them. The header still comes first, so the shared prefix holds (ADR-0001).
+    if args.variant:
+        variant = prompts.get(args.variant)
+        answering.TASK = variant.task
+        print(f'prompt: {variant.name}')
+    out = Path(args.out) if args.out else (
+        DIAGNOSTICS / f'replies_{args.variant}.json' if args.variant else OUT)
+    args.out = str(out)
 
     import ollama_client
     ollama_client.warm_up()

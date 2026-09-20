@@ -23,12 +23,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import prompts  # noqa: E402
 import transcripts  # noqa: E402
 import answering  # noqa: E402
-from answering import (  # noqa: E402
-    _find_segment, parse_reply, resolve_span, sentences_of,
-)
+from answering import _find_segment, sentences_of  # noqa: E402
 from utils import (  # noqa: E402
     Span, gold_evidence, group_questions_by_conversation, temporal_iou,
 )
@@ -69,7 +69,15 @@ def main() -> int:
     parser.add_argument('--replies', default=str(REPLIES))
     parser.add_argument('--diagnose', action='store_true')
     parser.add_argument('--worst', type=int, default=0, help='show the N worst questions')
+    parser.add_argument('--variant', default='baseline',
+                        help=f'which prompt these replies came from: '
+                             f'{", ".join(prompts.ALL)}')
     args = parser.parse_args()
+
+    # `baseline` is the shipped prompt and the shipped parsing, so the default
+    # path through here is unchanged; a variant brings its own reply fields and
+    # its own anchor, and goes through the same span logic after that.
+    variant = prompts.get(args.variant)
 
     replies: Dict[str, str] = json.loads(Path(args.replies).read_text())
 
@@ -90,7 +98,8 @@ def main() -> int:
                 continue
             rows_scored += 1
 
-            answer, index, quote = parse_reply(text)
+            answer, index, fields = variant.parse(text)
+            quote = fields.get('quote') or fields.get('first_words')
             if answer is False:
                 span: Optional[Span] = None
                 predicted_yes = False
@@ -99,7 +108,7 @@ def main() -> int:
                 segment = _find_segment(segments, index)
                 if segment is None:
                     segment = answering._best_keyword_segment(segments, row['question'])
-                span = resolve_span(segment, quote, sentences, row["question"])
+                span = variant.locate(segment, fields, sentences, row['question'])
 
             correct += (predicted_yes == (row['label'] == '1'))
 

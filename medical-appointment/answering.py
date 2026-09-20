@@ -523,6 +523,48 @@ def _finish(passage: Span, sentences: Sequence[Sentence]) -> Span:
     return _padded(_trim_openers(passage, sentences))
 
 
+def locate_quote(segment: Dict[str, Any], quote: Optional[str]) -> Optional[Span]:
+    """Where a quote lies inside one segment, or ``None`` if it does not.
+
+    Matched only within ``segment``, which is what stops a phrase repeated
+    elsewhere dragging the span to the wrong mention. The match is the longest
+    run of the quote's words appearing contiguously, so a model that drops or
+    adds a word at either end still localises.
+
+    Split out of :func:`resolve_span` so a prompt experiment can anchor on
+    something other than one quote -- two phrases marking each end, say --
+    without reimplementing the matcher and quietly changing it.
+    """
+    words = _words_of(segment)
+    wanted = _normalise(quote).split() if quote else []
+    if not words or not wanted:
+        return None
+
+    spoken = [_normalise(word['word']) for word in words]
+    best: Optional[Tuple[int, int]] = None
+    for length in range(len(wanted), 0, -1):
+        for offset in range(len(wanted) - length + 1):
+            needle = wanted[offset:offset + length]
+            for start in range(len(spoken) - length + 1):
+                if spoken[start:start + length] == needle:
+                    best = (start, start + length - 1)
+                    break
+            if best:
+                break
+        if best:
+            break
+
+    if best is None:
+        # Counted, not silenced: how often this fires is the measurement that
+        # says whether the quote path is worth keeping.
+        logger.info('FALLBACK quote-unmatched in segment %s: %r',
+                    segment['index'], quote)
+        return None
+
+    candidate = (float(words[best[0]]['start']), float(words[best[1]]['end']))
+    return candidate if candidate[1] > candidate[0] else None
+
+
 def resolve_span(
     segment: Dict[str, Any],
     quote: Optional[str],
@@ -531,44 +573,12 @@ def resolve_span(
 ) -> Span:
     """Locate the passage a quote was read off, inside one named segment.
 
-    The quote is matched only within ``segment`` -- that is what stops a phrase
-    repeated elsewhere dragging the span to the wrong mention -- and the match is
-    then rounded out to whole sentences by :func:`to_passage`. Falls back to the
-    segment's own bounds whenever the quote is missing or does not match. The
-    fallback is never ``None``: a loose span still scores, and ``None`` cannot.
+    The match is rounded out to whole sentences by :func:`to_passage`. Falls
+    back to the segment's own bounds whenever the quote is missing or does not
+    match. The fallback is never ``None``: a loose span still scores, and
+    ``None`` cannot.
     """
-    words = _words_of(segment)
-    wanted = _normalise(quote).split() if quote else []
-    span: Optional[Span] = None
-
-    if words and wanted:
-        spoken = [_normalise(word['word']) for word in words]
-
-        # Longest run of the quote appearing contiguously in the segment. A
-        # model that drops or adds a word at either end should still localise.
-        best: Optional[Tuple[int, int]] = None
-        for length in range(len(wanted), 0, -1):
-            for offset in range(len(wanted) - length + 1):
-                needle = wanted[offset:offset + length]
-                for start in range(len(spoken) - length + 1):
-                    if spoken[start:start + length] == needle:
-                        best = (start, start + length - 1)
-                        break
-                if best:
-                    break
-            if best:
-                break
-
-        if best is None:
-            # Counted, not silenced: how often this fires is the measurement
-            # that says whether the quote path is worth keeping.
-            logger.info('FALLBACK quote-unmatched in segment %s: %r',
-                        segment['index'], quote)
-        else:
-            candidate = (float(words[best[0]]['start']), float(words[best[1]]['end']))
-            if candidate[1] > candidate[0]:
-                span = candidate
-
+    span = locate_quote(segment, quote)
     if span is None:
         span = segment_bounds(segment)
     return to_passage(span, sentences, question)

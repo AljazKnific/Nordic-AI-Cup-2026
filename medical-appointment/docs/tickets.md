@@ -249,6 +249,86 @@ about hyphens ("anti" + "-inflammatory" against "anti-inflammatory") and one
 such word shifts every timing after it. `tools/align.py` reconciles the two
 streams on their letters; both failures are written into its docstring.
 
+## Three more prompts, captured and scored (2026-09-20)
+
+Three variants, each a mechanism the six earlier experiments did not test, each
+captured over all 390 questions through the real sequential shared-prefix path
+and scored through the same span logic (`tools/prompts.py`, `tools/bakeoff.py`).
+The shipped prompt's own capture is the control — re-captured over two
+conversations first and found byte-identical, 20 of 20, so the model is
+deterministic here and the 2026-09-18 capture is still a valid baseline.
+
+| prompt | accuracy | mean tIoU | score | vs baseline | 95% CI |
+| --- | --- | --- | --- | --- | --- |
+| baseline (shipped) | 0.990 | 0.6208 | **0.7684** | | |
+| ends | 0.990 | 0.5531 | 0.7278 | **-0.0406** | -0.0614 to -0.0213 |
+| key | 0.987 | 0.6099 | 0.7608 | -0.0075 | -0.0209 to +0.0059 |
+| proof | 0.990 | 0.6163 | 0.7657 | -0.0027 | -0.0108 to +0.0045 |
+
+The interval resamples whole conversations, paired — ten questions about one
+consultation are not ten independent observations, and resampling questions
+would report an interval several times too narrow.
+
+**None of them wins.** `ends` loses decisively; `key` and `proof` are
+indistinguishable from the shipped prompt and both trend down. That is nine
+prompt experiments on this case, and not one has ever been positive.
+
+### What each one was, and what it taught
+
+**ends** — `first_words` and `last_words` instead of one quote, so the model
+marks the passage's extent itself rather than having it guessed by the reach and
+the run cap. It is the worst of the three, and the attribution says exactly why:
+wrong-sentences loss rises from 0.106 to 0.171 and the questions already at
+their best fall from 107 to 90. Anchored on `first_words` alone it scores 0.451.
+**The model's own judgement of where a passage ends is worse than the
+heuristic's** — the third time it has lost a choice to the heuristic, after
+last-mention and the second pass.
+
+**key** — the quote unchanged, plus the shortest phrase inside it that states
+the answer, on the theory that the single quote field is doing two jobs at once:
+localising (which wants length, because the longest-run matcher is more reliable
+with more words) and anchoring the ranking (which wants tightness). Separating
+them is the cleanest thing left to try, and the decomposition is the most useful
+result of the three:
+
+| | mean tIoU |
+| --- | --- |
+| baseline capture, quote anchor | 0.6208 |
+| **key** capture, quote anchor only | **0.6233** |
+| **key** capture, key anchor as designed | **0.6099** |
+
+Asking for the extra field left the quote alone — scored on its quote, that
+capture is the baseline back again. **All of the loss is the tight anchor.** The
+model produced exactly what was asked for: a 0.84 s median anchor against the
+quote's 2.98 s, matching inside the named segment 100% of the time. So the model
+*can* be precise on demand, and precision at the anchor has **negative** value
+here, because the ranking's `kept` term needs the quote's breadth to hold on to
+the right sentence. That closes the "the quote does two jobs" theory from the
+inside: the localisation job is the one worth having.
+
+**proof** — the same schema, the quote reframed as what a reviewer checking the
+answer would be shown rather than "the words that answer it". The cheap arm, and
+the closest thing to a positive: -0.0027 with an interval straddling zero. It
+widened the quote (3.78 s against 2.98 s) and changed nothing that matters.
+
+### Cost, for the record
+
+Full captures ran 832 s (`ends`), 770 s (`key`) and 659 s (`proof`), or
+2.13 / 1.97 / 1.69 s a question — the extra reply fields do cost generation
+time, which would have mattered against a 45.3 s worst case had any of them won.
+
+### The protocol, which is the part worth keeping
+
+`tools/prompts.py` holds every variant as task text plus an anchor function, and
+`answering.TASK` is swapped **in memory** at capture time — so no experiment can
+leave the shipped prompt edited behind it, and two variants can be captured back
+to back without a stale `.pyc` between them. `tools/capture_replies.py
+--variant X` records, `tools/replay.py --variant X` scores one, and
+`tools/bakeoff.py` prints them all side by side with the paired interval.
+
+A tenth prompt needs a mechanism none of these nine tested. On the evidence of
+`key` especially, it should not be another way of asking for a tighter quote.
+
 ## The 0.61 run, and what it taught (2026-09-19)
 
 A hosted attempt after the fitting work scored **0.61**, down from 0.69, with two
@@ -649,6 +729,8 @@ shared prefix is warm.
 ./.venv/bin/python tools/disagreements.py  # which direction the error runs
 ./.venv/bin/python tools/extent.py         # is "extract less" a lever? seconds
 ./.venv/bin/python tools/timings.py        # two word-timing sources, head to head
+./.venv/bin/python tools/capture_replies.py --variant key   # ~12 min, one prompt
+./.venv/bin/python tools/bakeoff.py        # every captured prompt, side by side
 ./.venv-align/bin/python tools/align.py    # re-time with WhisperX, ~70 s, own venv
 TRANSCRIPTS_DIR=transcripts_aligned ./.venv/bin/python tools/replay.py
 ./.venv/bin/python local_evaluator.py     # a whole attempt through the live server, ~20 min
