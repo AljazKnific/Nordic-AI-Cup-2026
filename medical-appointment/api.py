@@ -78,4 +78,18 @@ def index():
 
 
 if __name__ == '__main__':
-    uvicorn.run('api:app', host=HOST, port=PORT)
+    # **Never close an idle connection before the evaluator has given up on
+    # one.** uvicorn's default keep-alive is 5 s and the evaluator's requests
+    # arrive 25-45 s apart, so the server closed every connection between them.
+    # A client holding that connection in a pool and writing its next POST as
+    # the close lands loses the request outright: it never reaches the ASGI app
+    # and nothing here logs an error, because a keep-alive close is routine.
+    #
+    # That is the signature seen on 2026-09-20 -- sample_45 absent from the log
+    # entirely, one 61.6 s gap between two ordinary requests, no exception --
+    # and on 2026-09-19, when sample_46 vanished the same way. A lost
+    # conversation is all ten of its marks.
+    #
+    # 75 s, above the evaluator's own 60 s timeout, so the close is always the
+    # client's to make.
+    uvicorn.run('api:app', host=HOST, port=PORT, timeout_keep_alive=75)

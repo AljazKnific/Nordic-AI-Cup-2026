@@ -35,7 +35,19 @@ Transcriber = Callable[[bytes], List[Dict[str, Any]]]
 # answered in 35.0 s by this clock and still timed out at the evaluator's 60 s,
 # so 25 s went somewhere this process could not see. Anything measured from
 # inside `predict` is measuring the wrong 50 seconds.
-REQUEST_BUDGET_SECONDS = float(os.environ.get('REQUEST_BUDGET', '50'))
+# 54, not 50, since 2026-09-20. On the hosted run that morning the worst
+# request was 47.8 s of wall against the evaluator's 60 s, so ~12 s of the
+# allowance was going unused -- while transcription ran out of budget on the
+# three longest conversations and returned a truncated transcript: 32 s of
+# audio unheard on sample_7, 26 s on sample_26, 7 s on sample_31. A question
+# whose evidence lies in that tail cannot be answered from words we never
+# transcribed. 54 hands transcription about four more seconds, ~21 s more audio
+# at 5.4x realtime, and still leaves ~6 s of slack against the timeout.
+#
+# Raise this further only against a measurement. A timeout costs all ten marks
+# of its conversation, which is more than every modelling change here has won
+# put together.
+REQUEST_BUDGET_SECONDS = float(os.environ.get('REQUEST_BUDGET', '54'))
 
 # What one answer costs once the prompt prefix is warm: 1.2-1.5 s on an M4 Pro,
 # 2.0-2.5 s on the hosted machine. The transcription deadline is derived from
@@ -43,7 +55,14 @@ REQUEST_BUDGET_SECONDS = float(os.environ.get('REQUEST_BUDGET', '50'))
 # to come need the time. A fixed 34 s was never consistent with the rest of the
 # budget -- 34 + 10 x 2.5 is 59 s against a 50 s allowance, which is precisely
 # how the hosted run came to guess its last few questions.
-SECONDS_PER_QUESTION = float(os.environ.get('SECONDS_PER_QUESTION', '2.5'))
+#
+# 2.1, not 2.5, since 2026-09-20: measured at 1.3-2.0 s a question across two
+# hosted runs, so 2.5 was reserving time the questions never used and taking it
+# from transcription. This buys transcription ~4 s without touching the timeout
+# margin, which is why it is preferred to raising REQUEST_BUDGET again. Still
+# above the worst per-question cost observed, deliberately -- underestimating
+# here is what makes a conversation guess its last few answers.
+SECONDS_PER_QUESTION = float(os.environ.get('SECONDS_PER_QUESTION', '2.1'))
 
 # Seconds of *actual transcription work*, never less, whatever the budget says.
 # This is a floor on work rather than a point on the clock on purpose: a slow
