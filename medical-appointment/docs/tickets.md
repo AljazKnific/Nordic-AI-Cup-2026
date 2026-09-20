@@ -145,6 +145,65 @@ run guessed its last few questions on every long conversation. The transcription
 deadline is now derived from what the remaining questions will cost, with a floor
 on *work seconds* so a slow upload can never leave transcription with nothing.
 
+## The 2026-09-20 attempts, and what the timeouts actually were
+
+Three hosted runs today, and the useful part is a **correction to the 19 Sep
+diagnosis** above.
+
+**`arrival-to-work` is 0.3-1.0 s, not 25 s.** That measurement is the whole
+point of the middleware `73c5fca` added, and now that it exists it says the
+upload gap is *not* a standing condition. Two runs from this branch this
+morning, 19 and 18 conversations:
+
+| | budget 50 | budget 54 |
+| --- | --- | --- |
+| requests / unique conversations | 20 / 19 | 19 / 18 |
+| **retries (an evaluator timeout)** | **1** | **1** |
+| worst total, our clock | 47.8 s | 46.6 s |
+| arrival-to-work, max | 0.7 s | 1.0 s |
+| transcripts truncated | 3 | 2 |
+
+So do not reach for the upload explanation again without checking the number.
+On 19 Sep it was real and worth 25 s; today it is half a second.
+
+**A run from `aljaz-medical` the same afternoon lost three conversations.** Our
+log shows 18 requests, every one 200 OK, worst case 49.6 s, and `sample_3` sent
+twice -- the retry that marks a timeout at the evaluator's end. The three the
+service reported are the three slowest by our own clock:
+
+```
+sample_31   transcribe 28.1s   answer 21.5s   total 49.6s
+sample_26   transcribe 25.4s   answer 23.3s   total 48.8s
+sample_7    transcribe 24.4s   answer 21.5s   total 45.9s
+```
+
+**Answering is measurably faster on this branch**, on identical conversations
+and the same evaluator, which is worth ~5 s a conversation:
+
+| | `aljaz-medical` | this branch |
+| --- | --- | --- |
+| sample_62 | 1.8 s/question | 1.3 s/question |
+| sample_73 | 1.6 s/question | 1.2 s/question |
+| worst total | 49.6 s | 46.6 s |
+
+**But the same three conversations are the slow ones on both branches**, and
+both of this morning's runs still took one retry each at 46-48 s. The honest
+read is that **the effective ceiling is nearer 45 s of our wall clock than the
+nominal 60 s**, and that the remaining fix is to finish sooner rather than to
+measure better. `REQUEST_BUDGET` is the dial -- an environment variable needing
+only a restart -- and the trade it buys is a truncated transcript and a few
+guessed late questions against ten marks lost outright.
+
+**The machine is the other constraint, and it bit once.** The endpoint was
+killed mid-session for memory: `PhysMem 23G used, 133M unused`, with Ollama
+holding qwen3:14b (~9.3 GB) pinned by `OLLAMA_KEEP_ALIVE=60m` -- deliberate, so
+a validation queue cannot unload the model and charge the reload to the first
+scored request. Run the endpoint **detached** (`nohup ... & disown`, so it
+reparents to init) rather than as a child of an editor or an agent session that
+may reclaim it, and close browsers during an attempt. The same conversation
+measured 30.2 s early in the session and 34.3 s under memory pressure later,
+which is most of the margin those three conversations do not have.
+
 ## Declined, with the evidence
 
 **Ticket 6 — matching question terms against garbled transcript words.** All four
