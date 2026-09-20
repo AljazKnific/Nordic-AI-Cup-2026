@@ -6,10 +6,18 @@ would be a silent bug rather than a fast one.
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-DIRECTORY = Path(__file__).resolve().parent / 'transcripts'
+ROOT = Path(__file__).resolve().parent
+
+# ``TRANSCRIPTS_DIR`` points the dev loop at a re-timed copy of the cache --
+# ``tools/align.py`` writes one -- so a timing experiment is scored through the
+# same code as everything else rather than a parallel path of its own. Relative
+# to the project, not to wherever the tool was run from. The request path never
+# reads the cache, so this cannot reach an attempt.
+DIRECTORY = ROOT / (os.environ.get('TRANSCRIPTS_DIR') or 'transcripts')
 
 
 def path_for(audio_filename: str) -> Path:

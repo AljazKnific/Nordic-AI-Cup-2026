@@ -1,7 +1,12 @@
 # Transcripts, captured model replies and model weights you cache locally
 transcripts/
+transcripts_aligned/
 models/
 diagnostics/
+
+# The forced-alignment experiment's own virtualenv (tools/align.py). Torch and
+# pyannote live in here and deliberately nowhere near the attempt's venv.
+.venv-align/
 
 # Generic Python files (Source: https://github.com/github/gitignore/blob/main/Python.gitignore)
 __pycache__/

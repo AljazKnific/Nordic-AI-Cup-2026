@@ -99,7 +99,8 @@ not a signal.
 **Transcription is not the constraint either.** The word timings we already have
 support a ceiling of **0.929** mean tIoU (`tools/score.py --ceiling-words`)
 against the 0.621 we return. Better ASR, forced alignment and diarisation all
-raise a ceiling that is already 0.31 above where we stand. The gap is in
+raise a ceiling that is already 0.31 above where we stand — and forced alignment
+has since been measured and does not even do that (2026-09-20, below). The gap is in
 *choosing* sub-sentence bounds from timings we hold, not in getting better ones.
 
 ## Is "extract less" a lever? Capped at +0.016, and every gate loses (2026-09-20)
@@ -176,6 +177,77 @@ the gated second pass (0.749/0.752), and the gates above. The untried lever is
 the one the ceiling table points at: our 0.634 against 0.929 for the best word
 run the existing ASR timings already support. Sub-sentence bounds, not fewer
 sentences.
+
+## WhisperX forced alignment: measured, and the ceiling goes **down** (2026-09-20)
+
+The standing note said the word-run ceiling of 0.929 could only be raised by
+finer timestamps, and named WhisperX forced alignment as the way to get them.
+Built (`tools/align.py`, in its own `.venv-align`) and measured
+(`tools/timings.py`). **It is worse, in every form the question can be asked.**
+
+| | mean tIoU |
+| --- | --- |
+| best word run, faster-whisper timings | **0.929** |
+| best word run, WhisperX forced alignment | 0.897 |
+| faster-whisper, calibrated offset | **0.942** |
+| WhisperX, calibrated offset | 0.936 |
+| an oracle taking each edge from whichever source is better | 0.9415 |
+
+And on the real system, replaying the frozen replies through aligned
+timings — the segment text and indices are untouched, so the same captured
+replies are still valid:
+
+| | accuracy | mean tIoU | score |
+| --- | --- | --- | --- |
+| today | 0.990 | 0.621 | **0.768** |
+| aligned timings | 0.990 | 0.585 | 0.747 |
+| aligned, with `PAD_SECONDS` re-fitted to them (0.05) | 0.990 | 0.592 | 0.751 |
+
+**Why it loses is the useful part.** Forced alignment does exactly what it
+promises: its word bounds hug the phonemes. Against our timings a word starts
+0.08 s later (median) and runs 0.16 s instead of 0.24 s. But an annotated
+passage is *not* drawn at phoneme onsets — it sits out in the silence around the
+speech, which is where faster-whisper's looser bounds already are. Measured as
+the distance from an annotated edge to the nearest boundary each source offers:
+
+| | start | end |
+| --- | --- | --- |
+| faster-whisper | 0.08 s | 0.06 s |
+| WhisperX | 0.10 s | 0.08 s |
+
+Sharper acoustics, further from where a human drew the line. The residual 0.07
+of ceiling is not quantisation we can dissolve with better timings; it is the
+annotation's own margin, and a constant offset already recovers most of what
+there is (0.929 -> 0.942).
+
+**Cost was never the obstacle**, for the record: alignment runs at 68x realtime,
+1.8 s per conversation on this machine, and placed all but 1 of 12,316 words. If
+it had helped it would have been affordable.
+
+**What this closes.** Every remaining item on the evidence side is about
+*choosing* the span, not measuring it. The ASR timings we already hold express
+the annotation better than a purpose-built aligner does, and the gap from 0.621
+to 0.929 is entirely in the choosing.
+
+Two things were left behind that are worth keeping:
+
+- `TRANSCRIPTS_DIR` now points any dev tool at an alternative transcript cache,
+  so a timing experiment is scored through the same code as everything else:
+  `TRANSCRIPTS_DIR=transcripts_aligned ./.venv/bin/python tools/replay.py`.
+- `tools/timings.py` compares any two caches head to head — raw ceiling,
+  calibrated ceiling, where the boundaries moved, and how far the annotation
+  sits from each. That is the measurement any future ASR change should have to
+  clear, and it takes about a minute.
+
+**The trap, if anyone re-runs the alignment.** `whisperx.align` re-splits the
+transcript into one segment per sentence and returns *more* segments than it was
+given (52 for 26 on the first conversation). Zipping the result against the
+input assigns each segment an earlier one's timings, which scores 0.485 and
+looks entirely plausible in the file. Read the flat `word_segments` list
+instead — and do not cut it by count either, because the two tokenisers disagree
+about hyphens ("anti" + "-inflammatory" against "anti-inflammatory") and one
+such word shifts every timing after it. `tools/align.py` reconciles the two
+streams on their letters; both failures are written into its docstring.
 
 ## The 0.61 run, and what it taught (2026-09-19)
 
@@ -534,13 +606,15 @@ returns in under a second):
 | Whole ASR segments | 0.521 |
 | Whole sentences | 0.708 |
 | Runs of up to four sentences | 0.815 |
-| Best word run | 0.928 |
-| Best word run, calibrated offset | 0.938 |
+| Best word run | 0.929 |
+| Best word run, calibrated offset | 0.942 |
+| Best word run, **WhisperX forced alignment** | 0.897 |
+| ...calibrated | 0.936 |
 
 **1.00 is not reachable.** A perfect system on today's ASR word timings caps at
 about 0.963 final score. The gap is uniform quantization error, not a fixable
-bias — only finer timestamps (WhisperX forced alignment) would raise it, and
-that should be measured with `--ceiling-words` before any of it is built.
+bias. **Finer timestamps do not raise it** — WhisperX forced alignment was built
+and measured on 2026-09-20 and the ceiling goes *down*; see the section above.
 Accuracy is worth +0.004 in total; do not spend time there.
 
 How the annotated passages sit against our sentences, over all 195 (recompute
@@ -574,6 +648,9 @@ shared prefix is warm.
 ./.venv/bin/python tools/replay.py --diagnose
 ./.venv/bin/python tools/disagreements.py  # which direction the error runs
 ./.venv/bin/python tools/extent.py         # is "extract less" a lever? seconds
+./.venv/bin/python tools/timings.py        # two word-timing sources, head to head
+./.venv-align/bin/python tools/align.py    # re-time with WhisperX, ~70 s, own venv
+TRANSCRIPTS_DIR=transcripts_aligned ./.venv/bin/python tools/replay.py
 ./.venv/bin/python local_evaluator.py     # a whole attempt through the live server, ~20 min
 caffeinate -dimsu ./.venv/bin/python api.py
 ```
